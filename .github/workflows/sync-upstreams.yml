@@ -1,0 +1,176 @@
+name: Sync upstream Alpha branches
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+    inputs:
+      source:
+        description: Upstream to integrate (refs are always Alpha)
+        required: true
+        type: choice
+        default: vernesong
+        options:
+          - vernesong
+          - metacubex
+      dry_run:
+        description: Validate and report without pushing a sync branch
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: sync-upstream-alpha
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: cheezy-wap
+          fetch-depth: 0
+
+      - name: Fetch explicit Alpha refs
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags https://github.com/vernesong/mihomo.git \
+            refs/heads/Alpha:refs/remotes/upstream/vernesong-alpha
+          git fetch --no-tags https://github.com/MetaCubeX/mihomo.git \
+            refs/heads/Alpha:refs/remotes/upstream/metacubex-alpha
+
+      - name: Verify provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          verify_ref() {
+            local ref="$1" trusted="$2"
+            test "$(git show "$ref:go.mod" | sed -n '1p')" = "module github.com/metacubex/mihomo"
+            for path in adapter config constant transport tunnel; do
+              git cat-file -e "$ref:$path"
+            done
+            git cat-file -e "$trusted^{commit}"
+            test -n "$(git merge-base "$ref" "$trusted")"
+          }
+          verify_ref refs/remotes/upstream/vernesong-alpha \
+            "$(jq -r '.primary.trusted_root' upstream-lock.json)"
+          verify_ref refs/remotes/upstream/metacubex-alpha \
+            "$(jq -r '.fallback.trusted_root' upstream-lock.json)"
+
+      - name: Test both upstreams
+        shell: bash
+        run: |
+          set -euo pipefail
+          original="$(git rev-parse HEAD)"
+          for ref in upstream/vernesong-alpha upstream/metacubex-alpha; do
+            git checkout --detach "$ref"
+            go test ./adapter/outbound ./component/dialer ./config
+          done
+          git checkout --detach "$original"
+
+      - name: Mirror validated source refs
+        if: ${{ github.event_name == 'schedule' || inputs.dry_run == false }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push origin +refs/remotes/upstream/vernesong-alpha:refs/heads/source/vernesong-alpha
+          git push origin +refs/remotes/upstream/metacubex-alpha:refs/heads/source/metacubex-alpha
+
+      - name: Select integration source
+        id: selected
+        shell: bash
+        env:
+          REQUESTED_SOURCE: ${{ inputs.source }}
+        run: |
+          set -euo pipefail
+          source="${REQUESTED_SOURCE:-vernesong}"
+          if [[ "$source" == "metacubex" ]]; then
+            ref=upstream/metacubex-alpha
+          else
+            source=vernesong
+            ref=upstream/vernesong-alpha
+          fi
+          sha="$(git rev-parse "$ref")"
+          echo "source=$source" >> "$GITHUB_OUTPUT"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${sha:0:12}" >> "$GITHUB_OUTPUT"
+
+      - name: Check fallback staleness
+        if: ${{ github.event_name == 'schedule' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          vernesong_date="$(git show -s --format=%ct upstream/vernesong-alpha)"
+          age_days="$(( ($(date +%s) - vernesong_date) / 86400 ))"
+          if git merge-base --is-ancestor upstream/metacubex-alpha upstream/vernesong-alpha; then
+            exit 0
+          fi
+          if (( age_days >= 14 )); then
+            title="MetaCubeX Alpha is ahead of vernesong Alpha"
+            if ! gh issue list --state open --search "$title in:title" --json title --jq 'length > 0' | grep -q true; then
+              gh issue create --title "$title" --body "MetaCubeX Alpha contains commits not present in vernesong Alpha. Vernesong has been idle for ${age_days} days. At 30 days, review a manual MetaCubeX sync using the workflow dispatch."
+            fi
+          fi
+
+      - name: Prepare sync pull request
+        if: ${{ (github.event_name == 'schedule' || inputs.dry_run == false) }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE: ${{ steps.selected.outputs.source }}
+          SOURCE_REF: ${{ steps.selected.outputs.ref }}
+          SOURCE_SHA: ${{ steps.selected.outputs.sha }}
+          SHORT_SHA: ${{ steps.selected.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+          if git merge-base --is-ancestor "$SOURCE_REF" HEAD; then
+            echo "cheezy-wap already contains $SOURCE_SHA"
+            exit 0
+          fi
+          if [[ "$SOURCE" == "metacubex" && "${{ github.event_name }}" == "schedule" ]]; then
+            vernesong_date="$(git show -s --format=%ct upstream/vernesong-alpha)"
+            age_days="$(( ($(date +%s) - vernesong_date) / 86400 ))"
+            (( age_days >= 30 )) || exit 0
+          fi
+          branch="sync/${SOURCE}-${SHORT_SHA}"
+          if gh pr list --state open --head "$branch" --json number --jq 'length > 0' | grep -q true; then
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git checkout -b "$branch"
+          if ! git merge --no-ff --no-edit "$SOURCE_REF"; then
+            git merge --abort
+            gh issue create --title "Conflict syncing ${SOURCE} Alpha ${SHORT_SHA}" \
+              --body "The automated merge into cheezy-wap conflicts. Resolve it locally after reviewing both upstreams."
+            exit 0
+          fi
+          tmp="$(mktemp)"
+          if [[ "$SOURCE" == "metacubex" ]]; then
+            jq --arg source "$SOURCE" --arg sha "$SOURCE_SHA" \
+              '.active_source = $source | .fallback.integrated_sha = $sha' \
+              upstream-lock.json > "$tmp"
+          else
+            jq --arg source "$SOURCE" --arg sha "$SOURCE_SHA" \
+              '.active_source = $source | .primary.integrated_sha = $sha' \
+              upstream-lock.json > "$tmp"
+          fi
+          mv "$tmp" upstream-lock.json
+          git add upstream-lock.json
+          git commit --amend --no-edit
+          git push origin "$branch"
+          draft=""
+          [[ "$SOURCE" == "metacubex" ]] && draft="--draft"
+          gh pr create $draft --base cheezy-wap --head "$branch" \
+            --title "Sync ${SOURCE} Alpha ${SHORT_SHA}" \
+            --body "Validated Alpha-only upstream sync. Source SHA: ${SOURCE_SHA}. This PR requires manual review and all Cheezy Core checks."

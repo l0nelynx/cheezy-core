@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "active_source": "vernesong",
+  "primary": {
+    "name": "vernesong",
+    "url": "https://github.com/vernesong/mihomo.git",
+    "branch": "Alpha",
+    "integrated_sha": "880847d582560df82ef7a36f858d42c8b64f7c66",
+    "trusted_root": "880847d582560df82ef7a36f858d42c8b64f7c66"
+  },
+  "fallback": {
+    "name": "metacubex",
+    "url": "https://github.com/MetaCubeX/mihomo.git",
+    "branch": "Alpha",
+    "integrated_sha": null,
+    "observed_sha": "f5fbe0c405fadb7f3e0337acb090e74fd9e8b278",
+    "trusted_root": "f5fbe0c405fadb7f3e0337acb090e74fd9e8b278"
+  }
+}
