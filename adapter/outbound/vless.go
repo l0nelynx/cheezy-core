@@ -493,7 +493,8 @@ func parseVlessAddr(metadata *C.Metadata, xudp bool) *vless.DstAddr {
 
 func NewVless(option VlessOption) (*Vless, error) {
 	option.Flow = strings.TrimSpace(option.Flow)
-	if option.Flow != "" {
+	network := strings.TrimSpace(option.Network)
+	if option.Flow != "" || (network != "" && !strings.EqualFold(network, "tcp")) {
 		option.XrayMux = XrayMuxOption{}
 	}
 	if option.XrayMux.Concurrency < 0 {
