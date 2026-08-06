@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -48,10 +49,11 @@ func serveEchoMux(conn net.Conn) {
 			}
 		}
 		if status == statusKeep && len(payload) > 0 {
-			meta, _ := encodeMetadata(id, statusKeep, optionData, nil)
+			meta, _ := encodeMetadata(id, statusKeep, optionData, nil, nil)
 			var size [2]byte
 			binary.BigEndian.PutUint16(size[:], uint16(len(payload)))
-			if writeAll(conn, append(append(meta, size[:]...), payload...)) != nil {
+			buffers := net.Buffers{meta, size[:], payload}
+			if _, err := buffers.WriteTo(conn); err != nil {
 				return
 			}
 		}
@@ -59,7 +61,7 @@ func serveEchoMux(conn net.Conn) {
 }
 
 func TestEncodeMetadataMatchesMuxCoolLayout(t *testing.T) {
-	frame, err := encodeMetadata(7, statusNew, 0, testTarget())
+	frame, err := encodeMetadata(7, statusNew, 0, testTarget(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,10 +76,25 @@ func TestEncodeMetadataMatchesMuxCoolLayout(t *testing.T) {
 	}
 }
 
+func TestEncodeMetadataUDPIncludesGlobalID(t *testing.T) {
+	target := &C.Metadata{NetWork: C.UDP, Host: "dns.google", DstPort: 53}
+	gid := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
+	frame, err := encodeMetadata(1, statusNew, 0, target, &gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frame[6] != targetUDP {
+		t.Fatalf("network = %d, want UDP", frame[6])
+	}
+	if !bytes.Equal(frame[len(frame)-8:], gid[:]) {
+		t.Fatalf("global id missing: %v", frame)
+	}
+}
+
 func TestPoolFillsWorkerBeforeOpeningAnother(t *testing.T) {
 	var mu sync.Mutex
 	dials := 0
-	pool := NewPool(2, 0, echoDialer(&dials, &mu), func(context.Context) string { return "test:443" })
+	pool := NewPool(Options{Concurrency: 2}, echoDialer(&dials, &mu), func(context.Context) string { return "test:443" })
 	defer pool.Close()
 
 	c1, err := pool.DialContext(context.Background(), testTarget())
@@ -119,19 +136,70 @@ func TestPoolFillsWorkerBeforeOpeningAnother(t *testing.T) {
 	_ = c3.Close()
 }
 
-func TestPoolRejectsWhenPhysicalLimitIsFull(t *testing.T) {
+func TestPoolPacksOverflowInsteadOfDropping(t *testing.T) {
 	globalPermits = permitRegistry{counts: make(map[string]int)}
 	var mu sync.Mutex
 	dials := 0
-	pool := NewPool(2, 1, echoDialer(&dials, &mu), func(context.Context) string { return "203.0.113.1:443" })
+	// concurrency=2 => hard=8; maxConnections=1 forces packing beyond soft limit.
+	pool := NewPool(Options{Concurrency: 2, MaxConnections: 1}, echoDialer(&dials, &mu), func(context.Context) string {
+		return "203.0.113.1:443"
+	})
 	defer pool.Close()
-	c1, _ := pool.DialContext(context.Background(), testTarget())
-	c2, _ := pool.DialContext(context.Background(), testTarget())
-	if _, err := pool.DialContext(context.Background(), testTarget()); !errorsIs(err, errMaxConnections) {
-		t.Fatalf("third dial error = %v", err)
+
+	var conns []net.Conn
+	for i := 0; i < 5; i++ {
+		c, err := pool.DialContext(context.Background(), testTarget())
+		if err != nil {
+			t.Fatalf("dial %d: %v", i, err)
+		}
+		conns = append(conns, c)
 	}
-	_ = c1.Close()
-	_ = c2.Close()
+	mu.Lock()
+	if dials != 1 {
+		t.Fatalf("overflow packed onto %d workers, want 1", dials)
+	}
+	mu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
+	}
+}
+
+func TestPoolWaitsWhenHardConcurrencyFull(t *testing.T) {
+	globalPermits = permitRegistry{counts: make(map[string]int)}
+	var mu sync.Mutex
+	dials := 0
+	// concurrency=1 => hard=4; fill all 4, then wait must respect context.
+	pool := NewPool(Options{Concurrency: 1, MaxConnections: 1}, echoDialer(&dials, &mu), func(context.Context) string {
+		return "203.0.113.9:443"
+	})
+	defer pool.Close()
+
+	var conns []net.Conn
+	for i := 0; i < 4; i++ {
+		c, err := pool.DialContext(context.Background(), testTarget())
+		if err != nil {
+			t.Fatalf("dial %d: %v", i, err)
+		}
+		conns = append(conns, c)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := pool.DialContext(ctx, testTarget()); err == nil {
+		t.Fatal("expected wait timeout when hard concurrency is full")
+	}
+
+	// Freeing a slot must unblock a waiter.
+	_ = conns[0].Close()
+	ctx2, cancel2 := context.WithTimeout(context.Background(), time.Second)
+	defer cancel2()
+	c, err := pool.DialContext(ctx2, testTarget())
+	if err != nil {
+		t.Fatalf("expected dial after free: %v", err)
+	}
+	_ = c.Close()
+	for _, c := range conns[1:] {
+		_ = c.Close()
+	}
 }
 
 func TestPermitIsSharedAcrossPools(t *testing.T) {
@@ -140,26 +208,36 @@ func TestPermitIsSharedAcrossPools(t *testing.T) {
 	dials := 0
 	dial := echoDialer(&dials, &mu)
 	key := func(context.Context) string { return netip.MustParseAddrPort("203.0.113.2:443").String() }
-	p1 := NewPool(1, 1, dial, key)
-	p2 := NewPool(1, 1, dial, key)
+	// concurrency=1, hard=4 — fill hard on p1 so p2 cannot dial a new carrier and must wait/fail.
+	p1 := NewPool(Options{Concurrency: 1, MaxConnections: 1}, dial, key)
+	p2 := NewPool(Options{Concurrency: 1, MaxConnections: 1}, dial, key)
 	defer p1.Close()
 	defer p2.Close()
-	c, err := p1.DialContext(context.Background(), testTarget())
-	if err != nil {
-		t.Fatal(err)
+	var held []net.Conn
+	for i := 0; i < 4; i++ {
+		c, err := p1.DialContext(context.Background(), testTarget())
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, c)
 	}
-	if _, err := p2.DialContext(context.Background(), testTarget()); !errorsIs(err, errMaxConnections) {
-		t.Fatalf("second pool error = %v", err)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := p2.DialContext(ctx, testTarget()); err == nil {
+		t.Fatal("second pool should not open beyond shared physical limit")
 	}
-	_ = c.Close()
+	for _, c := range held {
+		_ = c.Close()
+	}
 }
 
-func TestWorkerRetiresAfter128Sessions(t *testing.T) {
+func TestWorkerRetiresAfterConfiguredUses(t *testing.T) {
 	var mu sync.Mutex
 	dials := 0
-	pool := NewPool(1, 0, echoDialer(&dials, &mu), func(context.Context) string { return "test:443" })
+	const uses = 8
+	pool := NewPool(Options{Concurrency: 1, MaxWorkerUses: uses}, echoDialer(&dials, &mu), func(context.Context) string { return "test:443" })
 	defer pool.Close()
-	for i := 0; i < maxWorkerUses; i++ {
+	for i := 0; i < uses; i++ {
 		conn, err := pool.DialContext(context.Background(), testTarget())
 		if err != nil {
 			t.Fatalf("dial %d: %v", i, err)
@@ -174,8 +252,139 @@ func TestWorkerRetiresAfter128Sessions(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	if dials != 2 {
-		t.Fatalf("129 sessions opened %d workers, want 2", dials)
+		t.Fatalf("%d sessions opened %d workers, want 2", uses+1, dials)
 	}
+}
+
+func TestConcurrentDialDoesNotSerializeOnExistingWorker(t *testing.T) {
+	var mu sync.Mutex
+	dials := 0
+	var dialGate sync.WaitGroup
+	dialGate.Add(1)
+	slowDial := func(ctx context.Context) (net.Conn, error) {
+		client, server := net.Pipe()
+		mu.Lock()
+		dials++
+		n := dials
+		mu.Unlock()
+		if n == 1 {
+			// First carrier is immediate.
+			go serveEchoMux(server)
+			return client, nil
+		}
+		// Subsequent dials block until released — must not block soft-alloc on worker 1.
+		dialGate.Wait()
+		go serveEchoMux(server)
+		return client, nil
+	}
+	pool := NewPool(Options{Concurrency: 8}, slowDial, func(context.Context) string { return "test:443" })
+	defer pool.Close()
+
+	c1, err := pool.DialContext(context.Background(), testTarget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+
+	// Saturate soft concurrency so the next dial starts a new physical dial (blocked).
+	var fillers []net.Conn
+	for i := 0; i < 7; i++ {
+		c, err := pool.DialContext(context.Background(), testTarget())
+		if err != nil {
+			t.Fatal(err)
+		}
+		fillers = append(fillers, c)
+	}
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		_, _ = pool.DialContext(context.Background(), testTarget())
+	}()
+	<-started
+	time.Sleep(20 * time.Millisecond)
+
+	// Free one soft slot; allocation onto the existing worker must succeed without
+	// waiting for the in-flight physical dial.
+	_ = fillers[0].Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	c, err := pool.DialContext(ctx, testTarget())
+	if err != nil {
+		t.Fatalf("soft alloc blocked by in-flight dial: %v", err)
+	}
+	_ = c.Close()
+	dialGate.Done()
+	for _, c := range fillers[1:] {
+		_ = c.Close()
+	}
+}
+
+func TestHeadOfLineIsolationClosesSlowSession(t *testing.T) {
+	// Use TCP instead of net.Pipe to avoid bidirectional write deadlocks.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		server, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer server.Close()
+		for i := 0; i < 2; i++ {
+			if _, _, _, err := readMetadata(server); err != nil {
+				return
+			}
+		}
+		payload := make([]byte, 8*1024)
+		for i := 0; i < 10; i++ {
+			meta, _ := encodeMetadata(1, statusKeep, optionData, nil, nil)
+			var size [2]byte
+			binary.BigEndian.PutUint16(size[:], uint16(len(payload)))
+			buffers := net.Buffers{meta, size[:], payload}
+			if _, err := buffers.WriteTo(server); err != nil {
+				return
+			}
+		}
+		meta, _ := encodeMetadata(2, statusKeep, optionData, nil, nil)
+		msg := []byte("sibling-ok")
+		var size [2]byte
+		binary.BigEndian.PutUint16(size[:], uint16(len(msg)))
+		buffers := net.Buffers{meta, size[:], msg}
+		_, _ = buffers.WriteTo(server)
+		// Keep the connection open until the client finishes reading.
+		time.Sleep(500 * time.Millisecond)
+	}()
+
+	pool := NewPool(Options{Concurrency: 2}, func(context.Context) (net.Conn, error) {
+		return net.Dial("tcp", ln.Addr().String())
+	}, func(context.Context) string { return "test:443" })
+	defer pool.Close()
+
+	s1, err := pool.DialContext(context.Background(), testTarget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := pool.DialContext(context.Background(), testTarget())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_ = s2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	got := make([]byte, 10)
+	if _, err := io.ReadFull(s2, got); err != nil {
+		t.Fatalf("sibling blocked by slow session: %v", err)
+	}
+	if string(got) != "sibling-ok" {
+		t.Fatalf("got %q", got)
+	}
+	_ = s1.Close()
+	_ = s2.Close()
+	<-serverDone
 }
 
 func TestReadMetadataRejectsMalformedLength(t *testing.T) {
@@ -187,17 +396,45 @@ func TestReadMetadataRejectsMalformedLength(t *testing.T) {
 	}
 }
 
-func errorsIs(err, target error) bool {
-	for err != nil {
-		if err == target {
-			return true
-		}
-		type unwrapper interface{ Unwrap() error }
-		u, ok := err.(unwrapper)
-		if !ok {
-			return false
-		}
-		err = u.Unwrap()
+func TestDialDoesNotHoldLockAcrossPhysicalDial(t *testing.T) {
+	var dials atomic.Int32
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	dial := func(context.Context) (net.Conn, error) {
+		dials.Add(1)
+		started <- struct{}{}
+		<-release
+		client, server := net.Pipe()
+		go serveEchoMux(server)
+		return client, nil
 	}
-	return false
+	pool := NewPool(Options{Concurrency: 1}, dial, func(context.Context) string { return "lock-test:443" })
+	defer pool.Close()
+
+	errCh := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			_, err := pool.DialContext(context.Background(), testTarget())
+			errCh <- err
+		}()
+	}
+	// While dial is blocked, Close must still return (pool lock not held across dial).
+	<-started
+	done := make(chan struct{})
+	go func() {
+		_ = pool.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		close(release)
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("Close blocked while dial in progress")
+		}
+		return
+	}
+	close(release)
 }

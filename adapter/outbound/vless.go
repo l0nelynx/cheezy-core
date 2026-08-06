@@ -97,6 +97,7 @@ type XrayMuxOption struct {
 	Enabled        bool `proxy:"enabled,omitempty"`
 	Concurrency    int  `proxy:"concurrency,omitempty"`
 	MaxConnections int  `proxy:"max-connections,omitempty"`
+	MaxWorkerUses  int  `proxy:"max-worker-uses,omitempty"`
 }
 
 type XHTTPOptions struct {
@@ -398,6 +399,20 @@ func (v *Vless) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 		return nil, err
 	}
 
+	// Multiplex UDP as Mux.Cool UDP sub-connections (with XUDP Global ID) when enabled.
+	// Do NOT wrap with NewXUDPConn — that also speaks Mux.Cool and would double-frame.
+	if v.xrayMux != nil {
+		var globalID [8]byte
+		if metadata.SourceValid() {
+			globalID = utils.GlobalID(metadata.SourceAddress())
+		}
+		c, muxErr := v.xrayMux.DialUDPContext(ctx, metadata, globalID)
+		if muxErr != nil {
+			return nil, muxErr
+		}
+		return NewPacketConn(N.NewThreadSafePacketConn(newMuxPacketConn(c, metadata.UDPAddr())), v), nil
+	}
+
 	c, err := v.dialContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("%s connect error: %s", v.addr, err.Error())
@@ -428,6 +443,25 @@ func (v *Vless) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 		), v), nil
 	}
 	return NewPacketConn(N.NewThreadSafePacketConn(v.client.PacketConn(c, metadata.UDPAddr())), v), nil
+}
+
+// muxPacketConn adapts a connected Mux.Cool UDP session to PacketConn.
+type muxPacketConn struct {
+	net.Conn
+	addr net.Addr
+}
+
+func newMuxPacketConn(conn net.Conn, addr net.Addr) *muxPacketConn {
+	return &muxPacketConn{Conn: conn, addr: addr}
+}
+
+func (c *muxPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, err := c.Conn.Read(p)
+	return n, c.addr, err
+}
+
+func (c *muxPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+	return c.Conn.Write(p)
 }
 
 // SupportUOT implements C.ProxyAdapter
@@ -502,6 +536,9 @@ func NewVless(option VlessOption) (*Vless, error) {
 	}
 	if option.XrayMux.MaxConnections < 0 {
 		return nil, errors.New("xray-mux max-connections must not be negative")
+	}
+	if option.XrayMux.MaxWorkerUses < 0 {
+		return nil, errors.New("xray-mux max-worker-uses must not be negative")
 	}
 	var addons *vless.Addons
 	if len(option.Flow) >= 16 {
@@ -952,16 +989,11 @@ func NewVless(option VlessOption) (*Vless, error) {
 	}
 
 	if option.XrayMux.Enabled {
-		concurrency := option.XrayMux.Concurrency
-		if concurrency == 0 {
-			concurrency = 8
-		}
-		v.xrayMux = xraymux.NewPool(
-			concurrency,
-			option.XrayMux.MaxConnections,
-			v.dialXrayMux,
-			v.xrayMuxEndpointKey,
-		)
+		v.xrayMux = xraymux.NewPool(xraymux.Options{
+			Concurrency:    option.XrayMux.Concurrency,
+			MaxConnections: option.XrayMux.MaxConnections,
+			MaxWorkerUses:  option.XrayMux.MaxWorkerUses,
+		}, v.dialXrayMux, v.xrayMuxEndpointKey)
 	}
 
 	return v, nil

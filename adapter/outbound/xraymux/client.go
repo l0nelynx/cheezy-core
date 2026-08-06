@@ -11,7 +11,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/common/pool"
 	C "github.com/metacubex/mihomo/constant"
+
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -20,39 +23,150 @@ const (
 	statusEnd       byte = 0x03
 	statusKeepAlive byte = 0x04
 	optionData      byte = 0x01
+	optionError     byte = 0x02
 	targetTCP       byte = 0x01
+	targetUDP       byte = 0x02
 	maxFramePayload      = 8 * 1024
 	maxMetadataSize      = 512
-	maxWorkerUses        = 128
+	defaultMaxUses       = 128
+	defaultConcurrency   = 8
+	sessionPipeLimit     = 64 * 1024 // match xray-core pipe.WithSizeLimit(64*1024)
+	hardConcurrencyMult  = 4
 	workerIdleTime       = 16 * time.Second
 )
 
-var errMaxConnections = errors.New("xray mux: max connections reached")
+var (
+	errMaxConnections = errors.New("xray mux: max connections reached")
+	errPipeFull       = errors.New("xray mux: session pipe full")
+)
 
 type physicalDialer func(context.Context) (net.Conn, error)
 type endpointKeyer func(context.Context) string
 
-// Pool multiplexes logical TCP connections over Xray Mux.Cool workers.
-type Pool struct {
-	mu             sync.Mutex
-	workers        []*worker
-	concurrency    int
-	maxConnections int
-	dial           physicalDialer
-	endpointKey    endpointKeyer
-	closed         bool
+// Options configures a Mux.Cool client pool.
+type Options struct {
+	Concurrency    int // soft streams/worker; 0 -> 8
+	MaxConnections int // physical carriers; 0 -> unlimited
+	MaxWorkerUses  int // retire worker after N sessions; 0 -> 128
 }
 
-func NewPool(concurrency, maxConnections int, dial physicalDialer, endpointKey endpointKeyer) *Pool {
-	return &Pool{concurrency: concurrency, maxConnections: maxConnections, dial: dial, endpointKey: endpointKey}
+// Pool multiplexes logical TCP connections over Xray Mux.Cool workers.
+type Pool struct {
+	mu              sync.Mutex
+	workers         []*worker
+	concurrency     int
+	hardConcurrency int
+	maxConnections  int
+	maxWorkerUses   int
+	dial            physicalDialer
+	endpointKey     endpointKeyer
+	closed          bool
+	dialGroup       singleflight.Group
+	free            *sync.Cond
+}
+
+func NewPool(opts Options, dial physicalDialer, endpointKey endpointKeyer) *Pool {
+	concurrency := opts.Concurrency
+	if concurrency <= 0 {
+		concurrency = defaultConcurrency
+	}
+	maxUses := opts.MaxWorkerUses
+	if maxUses <= 0 {
+		maxUses = defaultMaxUses
+	}
+	hard := concurrency * hardConcurrencyMult
+	if hard < concurrency {
+		hard = concurrency
+	}
+	p := &Pool{
+		concurrency:     concurrency,
+		hardConcurrency: hard,
+		maxConnections:  opts.MaxConnections,
+		maxWorkerUses:   maxUses,
+		dial:            dial,
+		endpointKey:     endpointKey,
+	}
+	p.free = sync.NewCond(&p.mu)
+	return p
 }
 
 func (p *Pool) DialContext(ctx context.Context, metadata *C.Metadata) (net.Conn, error) {
+	if metadata == nil || metadata.NetWork != C.TCP {
+		return nil, errors.New("xray mux: only TCP targets are supported")
+	}
+	return p.dialSession(ctx, metadata, nil)
+}
+
+// DialUDPContext opens a Mux.Cool UDP sub-connection (XUDP Global ID optional).
+func (p *Pool) DialUDPContext(ctx context.Context, metadata *C.Metadata, globalID [8]byte) (net.Conn, error) {
+	if metadata == nil || metadata.NetWork != C.UDP {
+		return nil, errors.New("xray mux: DialUDPContext requires a UDP target")
+	}
+	return p.dialSession(ctx, metadata, &globalID)
+}
+
+func (p *Pool) dialSession(ctx context.Context, metadata *C.Metadata, globalID *[8]byte) (net.Conn, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		// 1) Soft-allocate onto an existing worker (brief lock, no I/O).
+		if s := p.tryReserve(p.concurrency); s != nil {
+			if err := s.worker.openSession(s, metadata, globalID); err != nil {
+				return nil, err
+			}
+			return s, nil
+		}
+
+		// 2) Dial a new physical carrier outside the pool lock (singleflight).
+		w, err := p.dialWorker(ctx)
+		if err == nil {
+			s := w.reserve(p.concurrency)
+			if s == nil {
+				// Another waiter may have filled it; try again.
+				continue
+			}
+			if err := w.openSession(s, metadata, globalID); err != nil {
+				return nil, err
+			}
+			return s, nil
+		}
+		if !errors.Is(err, errMaxConnections) {
+			return nil, err
+		}
+
+		// 3) At physical limit: pack onto existing carriers up to hard concurrency.
+		if s := p.tryReserve(p.hardConcurrency); s != nil {
+			if err := s.worker.openSession(s, metadata, globalID); err != nil {
+				return nil, err
+			}
+			return s, nil
+		}
+
+		// 4) Everything full: wait for a free stream slot (context-cancellable).
+		if err := p.waitForSlot(ctx); err != nil {
+			return nil, err
+		}
+	}
+}
+
+func (p *Pool) tryReserve(limit int) *session {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
-		return nil, net.ErrClosed
+		return nil
 	}
+	p.pruneLocked()
+	for _, w := range p.workers {
+		if s := w.reserve(limit); s != nil {
+			return s
+		}
+	}
+	return nil
+}
+
+func (p *Pool) pruneLocked() {
 	active := p.workers[:0]
 	for _, w := range p.workers {
 		if !w.isClosed() {
@@ -60,38 +174,104 @@ func (p *Pool) DialContext(ctx context.Context, metadata *C.Metadata) (net.Conn,
 		}
 	}
 	p.workers = active
-	for _, w := range p.workers {
-		if conn := w.allocate(metadata); conn != nil {
-			return conn, nil
+}
+
+func (p *Pool) dialWorker(ctx context.Context) (*worker, error) {
+	key := "_"
+	if p.endpointKey != nil {
+		if k := p.endpointKey(ctx); k != "" {
+			key = k
 		}
 	}
 
-	key := ""
-	if p.maxConnections > 0 {
-		key = p.endpointKey(ctx)
-		if !globalPermits.acquire(key, p.maxConnections) {
-			return nil, errMaxConnections
+	v, err, _ := p.dialGroup.Do(key, func() (any, error) {
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return nil, net.ErrClosed
 		}
-	}
-	physical, err := p.dial(ctx)
+		p.pruneLocked()
+		for _, w := range p.workers {
+			if !w.isClosed() && w.hasCapacity(p.concurrency) {
+				p.mu.Unlock()
+				return w, nil
+			}
+		}
+		permitKey := ""
+		if p.maxConnections > 0 {
+			permitKey = key
+			if !globalPermits.acquire(permitKey, p.maxConnections) {
+				p.mu.Unlock()
+				return nil, errMaxConnections
+			}
+		}
+		p.mu.Unlock()
+
+		physical, err := p.dial(ctx)
+		if err != nil {
+			if permitKey != "" {
+				globalPermits.release(permitKey)
+			}
+			return nil, err
+		}
+
+		release := func() {
+			if permitKey != "" {
+				globalPermits.release(permitKey)
+			}
+			p.signalFree()
+		}
+		w := newWorker(physical, p.maxWorkerUses, release)
+		w.onFree = p.signalFree
+
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			w.close()
+			return nil, net.ErrClosed
+		}
+		p.workers = append(p.workers, w)
+		p.mu.Unlock()
+		return w, nil
+	})
 	if err != nil {
-		if key != "" {
-			globalPermits.release(key)
-		}
 		return nil, err
 	}
-	w := newWorker(physical, p.concurrency, func() {
-		if key != "" {
-			globalPermits.release(key)
-		}
+	return v.(*worker), nil
+}
+
+func (p *Pool) waitForSlot(ctx context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	stop := context.AfterFunc(ctx, func() {
+		p.mu.Lock()
+		p.free.Broadcast()
+		p.mu.Unlock()
 	})
-	p.workers = append(p.workers, w)
-	conn := w.allocate(metadata)
-	if conn == nil {
-		w.close()
-		return nil, errors.New("xray mux: failed to allocate session")
+	defer stop()
+
+	for {
+		if p.closed {
+			return net.ErrClosed
+		}
+		p.pruneLocked()
+		for _, w := range p.workers {
+			if w.hasCapacity(p.hardConcurrency) {
+				return nil
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("waiting for xray mux slot: %w", err)
+		}
+		p.free.Wait()
 	}
-	return conn, nil
+}
+
+func (p *Pool) signalFree() {
+	p.mu.Lock()
+	p.free.Broadcast()
+	p.mu.Unlock()
 }
 
 func (p *Pool) Close() error {
@@ -103,6 +283,7 @@ func (p *Pool) Close() error {
 	p.closed = true
 	workers := append([]*worker(nil), p.workers...)
 	p.workers = nil
+	p.free.Broadcast()
 	p.mu.Unlock()
 	for _, w := range workers {
 		w.close()
@@ -138,28 +319,41 @@ func (r *permitRegistry) release(key string) {
 }
 
 type worker struct {
-	mu          sync.Mutex
-	writeMu     sync.Mutex
-	conn        net.Conn
-	sessions    map[uint16]*session
-	concurrency int
-	total       uint16
-	closed      bool
-	idleTimer   *time.Timer
-	release     func()
-	closeOnce   sync.Once
+	mu        sync.Mutex
+	writeMu   sync.Mutex
+	conn      net.Conn
+	sessions  map[uint16]*session
+	maxUses   int
+	total     uint16
+	closed    bool
+	idleTimer *time.Timer
+	release   func()
+	closeOnce sync.Once
+	onFree    func()
 }
 
-func newWorker(conn net.Conn, concurrency int, release func()) *worker {
-	w := &worker{conn: conn, sessions: make(map[uint16]*session), concurrency: concurrency, release: release}
+func newWorker(conn net.Conn, maxUses int, release func()) *worker {
+	w := &worker{
+		conn:     conn,
+		sessions: make(map[uint16]*session),
+		maxUses:  maxUses,
+		release:  release,
+	}
 	go w.readLoop()
 	return w
 }
 
-func (w *worker) allocate(metadata *C.Metadata) net.Conn {
+func (w *worker) hasCapacity(limit int) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.closed || len(w.sessions) >= w.concurrency || w.total >= maxWorkerUses {
+	return !w.closed && len(w.sessions) < limit && int(w.total) < w.maxUses
+}
+
+// reserve creates a session slot under w.mu without doing any network I/O.
+func (w *worker) reserve(limit int) *session {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed || len(w.sessions) >= limit || int(w.total) >= w.maxUses {
 		return nil
 	}
 	if w.idleTimer != nil {
@@ -168,29 +362,50 @@ func (w *worker) allocate(metadata *C.Metadata) net.Conn {
 	}
 	w.total++
 	s := &session{
-		id:      w.total,
-		worker:  w,
-		inbound: make(chan []byte, 8), // Xray uses a 64 KiB per-worker pipe.
-		done:    make(chan struct{}),
+		id:     w.total,
+		worker: w,
+		pipe:   newSessionPipe(sessionPipeLimit),
+		done:   make(chan struct{}),
 	}
 	w.sessions[s.id] = s
-	if err := w.writeFrame(s.id, statusNew, 0, metadata, nil); err != nil {
-		delete(w.sessions, s.id)
-		s.once.Do(func() { close(s.done) })
-		go w.close()
-		return nil
-	}
 	return s
+}
+
+// openSession sends the Mux.Cool New frame outside any worker/pool lock.
+func (w *worker) openSession(s *session, metadata *C.Metadata, globalID *[8]byte) error {
+	s.target = metadata
+	if err := w.writeFrame(s.id, statusNew, 0, metadata, globalID, nil); err != nil {
+		w.abandonSession(s)
+		go w.close()
+		return err
+	}
+	return nil
+}
+
+func (w *worker) abandonSession(s *session) {
+	w.mu.Lock()
+	delete(w.sessions, s.id)
+	w.mu.Unlock()
+	s.once.Do(func() {
+		s.pipe.close()
+		close(s.done)
+	})
+	if w.onFree != nil {
+		w.onFree()
+	}
 }
 
 func (w *worker) removeSession(id uint16) {
 	w.mu.Lock()
 	delete(w.sessions, id)
-	shouldClose := w.total >= maxWorkerUses && len(w.sessions) == 0
+	shouldClose := int(w.total) >= w.maxUses && len(w.sessions) == 0
 	if !shouldClose && len(w.sessions) == 0 && !w.closed {
 		w.idleTimer = time.AfterFunc(workerIdleTime, w.close)
 	}
 	w.mu.Unlock()
+	if w.onFree != nil {
+		w.onFree()
+	}
 	if shouldClose {
 		w.close()
 	}
@@ -217,7 +432,7 @@ func (w *worker) close() {
 		w.mu.Unlock()
 		_ = w.conn.Close()
 		for _, s := range sessions {
-			s.finish(false)
+			s.finish(false, false)
 		}
 		if w.release != nil {
 			w.release()
@@ -225,25 +440,22 @@ func (w *worker) close() {
 	})
 }
 
-func (w *worker) writeFrame(id uint16, status, option byte, target *C.Metadata, payload []byte) error {
-	meta, err := encodeMetadata(id, status, option, target)
+func (w *worker) writeFrame(id uint16, status, option byte, target *C.Metadata, globalID *[8]byte, payload []byte) error {
+	meta, err := encodeMetadata(id, status, option, target, globalID)
 	if err != nil {
 		return err
 	}
 	w.writeMu.Lock()
 	defer w.writeMu.Unlock()
-	if err := writeAll(w.conn, meta); err != nil {
-		return err
-	}
 	if option&optionData != 0 {
 		var size [2]byte
 		binary.BigEndian.PutUint16(size[:], uint16(len(payload)))
-		if err := writeAll(w.conn, size[:]); err != nil {
-			return err
-		}
-		return writeAll(w.conn, payload)
+		buffers := net.Buffers{meta, size[:], payload}
+		_, err = buffers.WriteTo(w.conn)
+		return err
 	}
-	return nil
+	_, err = w.conn.Write(meta)
+	return err
 }
 
 func (w *worker) readLoop() {
@@ -259,8 +471,10 @@ func (w *worker) readLoop() {
 			if _, err = io.ReadFull(w.conn, size[:]); err != nil {
 				return
 			}
-			payload = make([]byte, int(binary.BigEndian.Uint16(size[:])))
+			n := int(binary.BigEndian.Uint16(size[:]))
+			payload = pool.Get(n)
 			if _, err = io.ReadFull(w.conn, payload); err != nil {
+				_ = pool.Put(payload)
 				return
 			}
 		}
@@ -270,54 +484,159 @@ func (w *worker) readLoop() {
 		switch status {
 		case statusKeep:
 			if s == nil {
-				_ = w.writeFrame(id, statusEnd, 0, nil, nil)
+				if payload != nil {
+					_ = pool.Put(payload)
+				}
+				_ = w.writeFrame(id, statusEnd, 0, nil, nil, nil)
 				continue
 			}
 			if len(payload) > 0 {
 				if err := s.push(payload); err != nil {
-					s.finish(true)
+					_ = pool.Put(payload)
+					// Tear down the slow session without writing End inline from the
+					// demux loop (that can deadlock a full duplex pipe). Sibling
+					// sessions keep flowing; notify peer asynchronously.
+					s.finish(false, true)
+					go func(id uint16) {
+						_ = w.writeFrame(id, statusEnd, optionError, nil, nil, nil)
+					}(id)
 				}
 			}
 		case statusEnd:
+			if payload != nil {
+				_ = pool.Put(payload)
+			}
 			if s != nil {
-				s.finish(false)
+				s.finish(false, option&optionError != 0)
 			}
 		case statusKeepAlive, statusNew:
+			if payload != nil {
+				_ = pool.Put(payload)
+			}
 			// Xray clients discard unsolicited heartbeat/reverse data.
 		default:
+			if payload != nil {
+				_ = pool.Put(payload)
+			}
 			return
 		}
 	}
 }
 
+type sessionPipe struct {
+	mu     sync.Mutex
+	cond   *sync.Cond
+	chunks [][]byte
+	nbytes int
+	limit  int
+	closed bool
+}
+
+func newSessionPipe(limit int) *sessionPipe {
+	p := &sessionPipe{limit: limit}
+	p.cond = sync.NewCond(&p.mu)
+	return p
+}
+
+func (p *sessionPipe) tryWrite(data []byte) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return net.ErrClosed
+	}
+	if p.nbytes+len(data) > p.limit {
+		return errPipeFull
+	}
+	// data is already a pooled buffer owned by the pipe until read consumes it.
+	p.chunks = append(p.chunks, data)
+	p.nbytes += len(data)
+	p.cond.Signal()
+	return nil
+}
+
+func (p *sessionPipe) readDeadline(dst []byte, deadline time.Time) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for len(p.chunks) == 0 && !p.closed {
+		if !deadline.IsZero() {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return 0, os.ErrDeadlineExceeded
+			}
+			timer := time.AfterFunc(remaining, func() {
+				p.mu.Lock()
+				p.cond.Broadcast()
+				p.mu.Unlock()
+			})
+			p.cond.Wait()
+			timer.Stop()
+			if len(p.chunks) == 0 && !p.closed && !time.Now().Before(deadline) {
+				return 0, os.ErrDeadlineExceeded
+			}
+			continue
+		}
+		p.cond.Wait()
+	}
+	if len(p.chunks) == 0 {
+		return 0, io.EOF
+	}
+	chunk := p.chunks[0]
+	n := copy(dst, chunk)
+	if n == len(chunk) {
+		p.chunks = p.chunks[1:]
+		_ = pool.Put(chunk)
+	} else {
+		left := pool.Get(len(chunk) - n)
+		copy(left, chunk[n:])
+		_ = pool.Put(chunk)
+		p.chunks[0] = left
+	}
+	p.nbytes -= n
+	return n, nil
+}
+
+func (p *sessionPipe) close() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return
+	}
+	p.closed = true
+	for _, c := range p.chunks {
+		_ = pool.Put(c)
+	}
+	p.chunks = nil
+	p.nbytes = 0
+	p.cond.Broadcast()
+}
+
 type session struct {
 	id            uint16
 	worker        *worker
-	inbound       chan []byte
+	target        *C.Metadata
+	pipe          *sessionPipe
 	done          chan struct{}
 	once          sync.Once
 	readMu        sync.Mutex
-	readBuf       []byte
 	deadlineMu    sync.Mutex
 	readDeadline  time.Time
 	writeDeadline time.Time
 }
 
 func (s *session) push(payload []byte) error {
-	copyPayload := append([]byte(nil), payload...)
-	select {
-	case s.inbound <- copyPayload:
-		return nil
-	case <-s.done:
-		return net.ErrClosed
-	}
+	return s.pipe.tryWrite(payload)
 }
 
-func (s *session) finish(sendEnd bool) {
+func (s *session) finish(sendEnd, withError bool) {
 	s.once.Do(func() {
 		if sendEnd && !s.worker.isClosed() {
-			_ = s.worker.writeFrame(s.id, statusEnd, 0, nil, nil)
+			opt := byte(0)
+			if withError {
+				opt = optionError
+			}
+			_ = s.worker.writeFrame(s.id, statusEnd, opt, nil, nil, nil)
 		}
+		s.pipe.close()
 		close(s.done)
 		s.worker.removeSession(s.id)
 	})
@@ -329,31 +648,7 @@ func (s *session) Read(p []byte) (int, error) {
 	}
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
-	if len(s.readBuf) > 0 {
-		n := copy(p, s.readBuf)
-		s.readBuf = s.readBuf[n:]
-		return n, nil
-	}
-	deadline := s.getReadDeadline()
-	var timer <-chan time.Time
-	if !deadline.IsZero() {
-		if !time.Now().Before(deadline) {
-			return 0, os.ErrDeadlineExceeded
-		}
-		t := time.NewTimer(time.Until(deadline))
-		defer t.Stop()
-		timer = t.C
-	}
-	select {
-	case data := <-s.inbound:
-		n := copy(p, data)
-		s.readBuf = data[n:]
-		return n, nil
-	case <-s.done:
-		return 0, io.EOF
-	case <-timer:
-		return 0, os.ErrDeadlineExceeded
-	}
+	return s.pipe.readDeadline(p, s.getReadDeadline())
 }
 
 func (s *session) Write(p []byte) (int, error) {
@@ -372,7 +667,12 @@ func (s *session) Write(p []byte) (int, error) {
 		if n > maxFramePayload {
 			n = maxFramePayload
 		}
-		if err := s.worker.writeFrame(s.id, statusKeep, optionData, nil, p[:n]); err != nil {
+		// UDP Keep frames must repeat the destination address (Mux.Cool).
+		var keepTarget *C.Metadata
+		if s.target != nil && s.target.NetWork == C.UDP {
+			keepTarget = s.target
+		}
+		if err := s.worker.writeFrame(s.id, statusKeep, optionData, keepTarget, nil, p[:n]); err != nil {
 			s.worker.close()
 			return written, err
 		}
@@ -382,7 +682,7 @@ func (s *session) Write(p []byte) (int, error) {
 	return written, nil
 }
 
-func (s *session) Close() error         { s.finish(true); return nil }
+func (s *session) Close() error         { s.finish(true, false); return nil }
 func (s *session) LocalAddr() net.Addr  { return muxAddr("xray-mux-local") }
 func (s *session) RemoteAddr() net.Addr { return muxAddr("xray-mux-remote") }
 
@@ -424,16 +724,24 @@ type muxAddr string
 func (a muxAddr) Network() string { return "xray-mux" }
 func (a muxAddr) String() string  { return string(a) }
 
-func encodeMetadata(id uint16, status, option byte, target *C.Metadata) ([]byte, error) {
+func encodeMetadata(id uint16, status, option byte, target *C.Metadata, globalID *[8]byte) ([]byte, error) {
 	body := make([]byte, 4, 64)
 	binary.BigEndian.PutUint16(body[:2], id)
 	body[2] = status
 	body[3] = option
-	if status == statusNew {
-		if target == nil || target.NetWork != C.TCP {
-			return nil, errors.New("xray mux: only TCP targets are supported")
+	needAddr := status == statusNew || (status == statusKeep && target != nil && target.NetWork == C.UDP)
+	if needAddr {
+		if target == nil {
+			return nil, errors.New("xray mux: missing target for frame")
 		}
-		body = append(body, targetTCP)
+		switch target.NetWork {
+		case C.TCP:
+			body = append(body, targetTCP)
+		case C.UDP:
+			body = append(body, targetUDP)
+		default:
+			return nil, errors.New("xray mux: unsupported network type")
+		}
 		var port [2]byte
 		binary.BigEndian.PutUint16(port[:], target.DstPort)
 		body = append(body, port[:]...)
@@ -441,6 +749,13 @@ func encodeMetadata(id uint16, status, option byte, target *C.Metadata) ([]byte,
 		body, err = appendAddress(body, target)
 		if err != nil {
 			return nil, err
+		}
+		if status == statusNew && target.NetWork == C.UDP {
+			var gid [8]byte
+			if globalID != nil {
+				gid = *globalID
+			}
+			body = append(body, gid[:]...)
 		}
 	}
 	if len(body) > maxMetadataSize {
@@ -488,18 +803,4 @@ func readMetadata(r io.Reader) (id uint16, status, option byte, err error) {
 	status = meta[2]
 	option = meta[3]
 	return
-}
-
-func writeAll(w io.Writer, p []byte) error {
-	for len(p) > 0 {
-		n, err := w.Write(p)
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return io.ErrShortWrite
-		}
-		p = p[n:]
-	}
-	return nil
 }

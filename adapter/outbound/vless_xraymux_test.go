@@ -55,6 +55,11 @@ func TestVlessXrayMuxRejectsNegativeValues(t *testing.T) {
 	if _, err := NewVless(option); err == nil {
 		t.Fatal("expected negative max-connections error")
 	}
+	option = baseXrayMuxVlessOption()
+	option.XrayMux.MaxWorkerUses = -1
+	if _, err := NewVless(option); err == nil {
+		t.Fatal("expected negative max-worker-uses error")
+	}
 }
 
 func TestVlessXrayMuxZeroConcurrencyUsesDefault(t *testing.T) {
