@@ -319,6 +319,17 @@ func TestConcurrentDialDoesNotSerializeOnExistingWorker(t *testing.T) {
 	}
 }
 
+func TestSessionPipeLimitMatchesXraySessionBuffer(t *testing.T) {
+	// Guard against reintroducing the 64KiB mis-copy of xray's *worker* pipe
+	// limit as the per-session download window (that capped speed at ~window/RTT).
+	if sessionPipeLimit < 512*1024 {
+		t.Fatalf("sessionPipeLimit=%d, want >= 512KiB (xray PerConnection)", sessionPipeLimit)
+	}
+	if workerReadBuffer < 64*1024 {
+		t.Fatalf("workerReadBuffer=%d, want >= 64KiB", workerReadBuffer)
+	}
+}
+
 func TestPipeBackpressureDoesNotKillDownload(t *testing.T) {
 	// Producer outruns consumer: the pipe must block (TCP backpressure), not
 	// tear down the session. Killing on full was collapsing speedtest download.
@@ -328,7 +339,7 @@ func TestPipeBackpressureDoesNotKillDownload(t *testing.T) {
 	}
 	defer ln.Close()
 
-	const total = 256 * 1024 // well above the 64KiB pipe
+	const total = 2 * 1024 * 1024 // well above the 512KiB session pipe
 	payload := bytes.Repeat([]byte("D"), 4*1024)
 	frames := total / len(payload)
 

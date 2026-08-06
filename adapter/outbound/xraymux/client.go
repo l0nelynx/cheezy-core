@@ -1,6 +1,7 @@
 package xraymux
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -30,9 +31,17 @@ const (
 	maxMetadataSize      = 512
 	defaultMaxUses       = 128
 	defaultConcurrency   = 8
-	sessionPipeLimit     = 64 * 1024 // match xray-core pipe.WithSizeLimit(64*1024)
-	hardConcurrencyMult  = 4
-	workerIdleTime       = 16 * time.Second
+	// Per-session download window. xray-core's 64KiB pipe.WithSizeLimit is the
+	// *worker carrier* cushion between TLS and demux — not the app buffer.
+	// Session output there defaults to policy.Buffer.PerConnection (512KiB on
+	// amd64). Matching the carrier limit here capped bulk download at ~window/RTT
+	// (~60Mbps @ ~8ms) after the initial socket-buffer burst.
+	sessionPipeLimit = 512 * 1024
+	// Userspace cushion on the physical downlink so a brief session push stall
+	// does not immediately starve the TCP receive window (xray worker pipe size).
+	workerReadBuffer    = 64 * 1024
+	hardConcurrencyMult = 4
+	workerIdleTime      = 16 * time.Second
 )
 
 var (
@@ -460,20 +469,21 @@ func (w *worker) writeFrame(id uint16, status, option byte, target *C.Metadata, 
 
 func (w *worker) readLoop() {
 	defer w.close()
+	r := bufio.NewReaderSize(w.conn, workerReadBuffer)
 	for {
-		id, status, option, err := readMetadata(w.conn)
+		id, status, option, err := readMetadata(r)
 		if err != nil {
 			return
 		}
 		var payload []byte
 		if option&optionData != 0 {
 			var size [2]byte
-			if _, err = io.ReadFull(w.conn, size[:]); err != nil {
+			if _, err = io.ReadFull(r, size[:]); err != nil {
 				return
 			}
 			n := int(binary.BigEndian.Uint16(size[:]))
 			payload = pool.Get(n)
-			if _, err = io.ReadFull(w.conn, payload); err != nil {
+			if _, err = io.ReadFull(r, payload); err != nil {
 				_ = pool.Put(payload)
 				return
 			}
@@ -491,11 +501,9 @@ func (w *worker) readLoop() {
 				continue
 			}
 			if len(payload) > 0 {
-				// Block when the per-session pipe is full (same as xray-core's
-				// 64KiB pipe). Closing the session here killed bulk downloads:
-				// the producer outruns the consumer briefly, the pipe fills,
-				// and we used to tear the stream down → download ≈ 0 while
-				// upload (Write path) still worked.
+				// Block when the per-session pipe is full (TCP backpressure).
+				// Do not tear the session down — that collapsed bulk download
+				// while upload (Write path) kept working.
 				if err := s.push(payload); err != nil {
 					_ = pool.Put(payload)
 				}
