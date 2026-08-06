@@ -319,72 +319,81 @@ func TestConcurrentDialDoesNotSerializeOnExistingWorker(t *testing.T) {
 	}
 }
 
-func TestHeadOfLineIsolationClosesSlowSession(t *testing.T) {
-	// Use TCP instead of net.Pipe to avoid bidirectional write deadlocks.
+func TestPipeBackpressureDoesNotKillDownload(t *testing.T) {
+	// Producer outruns consumer: the pipe must block (TCP backpressure), not
+	// tear down the session. Killing on full was collapsing speedtest download.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ln.Close()
 
-	serverDone := make(chan struct{})
+	const total = 256 * 1024 // well above the 64KiB pipe
+	payload := bytes.Repeat([]byte("D"), 4*1024)
+	frames := total / len(payload)
+
+	serverDone := make(chan error, 1)
 	go func() {
-		defer close(serverDone)
 		server, err := ln.Accept()
 		if err != nil {
+			serverDone <- err
 			return
 		}
 		defer server.Close()
-		for i := 0; i < 2; i++ {
-			if _, _, _, err := readMetadata(server); err != nil {
-				return
-			}
+		if _, _, _, err := readMetadata(server); err != nil {
+			serverDone <- err
+			return
 		}
-		payload := make([]byte, 8*1024)
-		for i := 0; i < 10; i++ {
+		for i := 0; i < frames; i++ {
 			meta, _ := encodeMetadata(1, statusKeep, optionData, nil, nil)
 			var size [2]byte
 			binary.BigEndian.PutUint16(size[:], uint16(len(payload)))
 			buffers := net.Buffers{meta, size[:], payload}
 			if _, err := buffers.WriteTo(server); err != nil {
+				serverDone <- err
 				return
 			}
 		}
-		meta, _ := encodeMetadata(2, statusKeep, optionData, nil, nil)
-		msg := []byte("sibling-ok")
-		var size [2]byte
-		binary.BigEndian.PutUint16(size[:], uint16(len(msg)))
-		buffers := net.Buffers{meta, size[:], msg}
-		_, _ = buffers.WriteTo(server)
-		// Keep the connection open until the client finishes reading.
-		time.Sleep(500 * time.Millisecond)
+		meta, _ := encodeMetadata(1, statusEnd, 0, nil, nil)
+		if _, err := server.Write(meta); err != nil {
+			serverDone <- err
+			return
+		}
+		serverDone <- nil
 	}()
 
-	pool := NewPool(Options{Concurrency: 2}, func(context.Context) (net.Conn, error) {
+	pool := NewPool(Options{Concurrency: 1}, func(context.Context) (net.Conn, error) {
 		return net.Dial("tcp", ln.Addr().String())
 	}, func(context.Context) string { return "test:443" })
 	defer pool.Close()
 
-	s1, err := pool.DialContext(context.Background(), testTarget())
+	conn, err := pool.DialContext(context.Background(), testTarget())
 	if err != nil {
 		t.Fatal(err)
 	}
-	s2, err := pool.DialContext(context.Background(), testTarget())
-	if err != nil {
-		t.Fatal(err)
-	}
+	defer conn.Close()
 
-	_ = s2.SetReadDeadline(time.Now().Add(2 * time.Second))
-	got := make([]byte, 10)
-	if _, err := io.ReadFull(s2, got); err != nil {
-		t.Fatalf("sibling blocked by slow session: %v", err)
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	got := 0
+	buf := make([]byte, 8*1024)
+	for got < total {
+		n, err := conn.Read(buf)
+		if n > 0 {
+			got += n
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("download aborted after %d/%d bytes: %v", got, total, err)
+		}
 	}
-	if string(got) != "sibling-ok" {
-		t.Fatalf("got %q", got)
+	if got != total {
+		t.Fatalf("got %d bytes, want %d", got, total)
 	}
-	_ = s1.Close()
-	_ = s2.Close()
-	<-serverDone
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestReadMetadataRejectsMalformedLength(t *testing.T) {

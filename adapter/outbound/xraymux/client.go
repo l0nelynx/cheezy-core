@@ -37,7 +37,6 @@ const (
 
 var (
 	errMaxConnections = errors.New("xray mux: max connections reached")
-	errPipeFull       = errors.New("xray mux: session pipe full")
 )
 
 type physicalDialer func(context.Context) (net.Conn, error)
@@ -432,6 +431,7 @@ func (w *worker) close() {
 		w.mu.Unlock()
 		_ = w.conn.Close()
 		for _, s := range sessions {
+			s.pipe.drop()
 			s.finish(false, false)
 		}
 		if w.release != nil {
@@ -491,15 +491,13 @@ func (w *worker) readLoop() {
 				continue
 			}
 			if len(payload) > 0 {
+				// Block when the per-session pipe is full (same as xray-core's
+				// 64KiB pipe). Closing the session here killed bulk downloads:
+				// the producer outruns the consumer briefly, the pipe fills,
+				// and we used to tear the stream down → download ≈ 0 while
+				// upload (Write path) still worked.
 				if err := s.push(payload); err != nil {
 					_ = pool.Put(payload)
-					// Tear down the slow session without writing End inline from the
-					// demux loop (that can deadlock a full duplex pipe). Sibling
-					// sessions keep flowing; notify peer asynchronously.
-					s.finish(false, true)
-					go func(id uint16) {
-						_ = w.writeFrame(id, statusEnd, optionError, nil, nil, nil)
-					}(id)
 				}
 			}
 		case statusEnd:
@@ -538,20 +536,23 @@ func newSessionPipe(limit int) *sessionPipe {
 	return p
 }
 
-func (p *sessionPipe) tryWrite(data []byte) error {
+func (p *sessionPipe) write(data []byte) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed {
-		return net.ErrClosed
+	for {
+		if p.closed {
+			return net.ErrClosed
+		}
+		if p.nbytes+len(data) <= p.limit {
+			// data is already a pooled buffer owned by the pipe until read consumes it.
+			p.chunks = append(p.chunks, data)
+			p.nbytes += len(data)
+			p.cond.Signal()
+			return nil
+		}
+		// Apply backpressure: wait until the consumer drains enough space.
+		p.cond.Wait()
 	}
-	if p.nbytes+len(data) > p.limit {
-		return errPipeFull
-	}
-	// data is already a pooled buffer owned by the pipe until read consumes it.
-	p.chunks = append(p.chunks, data)
-	p.nbytes += len(data)
-	p.cond.Signal()
-	return nil
 }
 
 func (p *sessionPipe) readDeadline(dst []byte, deadline time.Time) (int, error) {
@@ -592,6 +593,8 @@ func (p *sessionPipe) readDeadline(dst []byte, deadline time.Time) (int, error) 
 		p.chunks[0] = left
 	}
 	p.nbytes -= n
+	// Wake a blocked demux writer waiting for pipe space.
+	p.cond.Broadcast()
 	return n, nil
 }
 
@@ -601,6 +604,17 @@ func (p *sessionPipe) close() {
 	if p.closed {
 		return
 	}
+	p.closed = true
+	// Keep buffered chunks so Read can drain in-flight download data after End.
+	// Discarding here truncated speedtest downloads when End arrived before the
+	// consumer emptied the pipe.
+	p.cond.Broadcast()
+}
+
+// drop releases any remaining pooled chunks. Only for hard worker teardown.
+func (p *sessionPipe) drop() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.closed = true
 	for _, c := range p.chunks {
 		_ = pool.Put(c)
@@ -624,7 +638,7 @@ type session struct {
 }
 
 func (s *session) push(payload []byte) error {
-	return s.pipe.tryWrite(payload)
+	return s.pipe.write(payload)
 }
 
 func (s *session) finish(sendEnd, withError bool) {
