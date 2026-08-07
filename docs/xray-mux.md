@@ -9,32 +9,32 @@ Wire-протокол совместим с **xray-core**.
 ```yaml
 xray-mux:
   enabled: true
-  concurrency: 2            # soft: сколько стримов на один carrier до открытия нового
-  max-connections: 0        # физ. carrier’ов; 0 = без лимита
-  max-worker-uses: 128      # 0 → 128
+  concurrency: 4              # soft streams/carrier after carriers are grown
+  max-connections: 3          # soft-grow target + hard cap (0 = pack-first, unlimited)
+  max-dials-per-minute: 3     # handshake budget; 0 = unlimited
+  max-worker-uses: 128        # 0 → 128
 ```
 
 Только raw TCP VLESS; `flow` / ws / grpc / xhttp → mux тихо выключается.
 
-## Поведение (актуальная стабильная линия)
+## Политика пула (xmux-inspired)
 
-После регрессии demux-isolation / spread-first клиент **откатан** к модели:
-
-- **Pack-first**: сначала заполняется soft `concurrency` на существующем carrier, потом новый
-- Per-session download pipe **512KiB** + `bufio` 64KiB на demux
-- Backpressure при полном pipe (**блок demux**, сессию не рвём)
-
-Это состояние после фиксов download≈0 (kill-on-full) и плато ~60Mbps из‑за окна 64KiB.
-
-### Практические настройки на LTE
-
-| Цель | Конфиг |
+| `max-connections` | Поведение |
 |---|---|
-| Скорость multi-stream | низкий `concurrency` (1–2) → больше физических TCP |
-| Меньше handshake | высокий `concurrency` / `max-connections: 1` → один TCP, скорость ниже |
+| `0` | **Pack-first**: заполняем soft `concurrency`, потом новый dial |
+| `> 0` | **Soft-grow**: пока carrier’ов < max — новый dial (сериализованно); затем **least-loaded** pack; hard = `concurrency×4`; потом wait |
 
-Один TCP не масштабируется на несколько жадных download’ов (одно cwnd + TCP HoL).
+`max-dials-per-minute`: sliding window на новые physical dials. При исчерпании бюджета — pack на существующие, без ожидания новой минуты (если есть soft/hard слот).
 
+### Практические настройки под цензор ≤3 TLS/мин
+
+```yaml
+concurrency: 4
+max-connections: 3
+max-dials-per-minute: 3
+```
+
+Не ставь `max-connections: 1` «ради concurrency» — concurrency тогда почти не влияет на handshake.
 ### Локальный бенч (ядро + Xray)
 
 ```bash

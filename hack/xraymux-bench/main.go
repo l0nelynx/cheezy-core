@@ -30,11 +30,12 @@ import (
 )
 
 type configCase struct {
-	Name           string `json:"name"`
-	Concurrency    int    `json:"concurrency"`
-	MaxConnections int    `json:"max_connections"`
-	MuxEnabled     bool   `json:"mux_enabled"`
-	Streams        int    `json:"streams"`
+	Name              string `json:"name"`
+	Concurrency       int    `json:"concurrency"`
+	MaxConnections    int    `json:"max_connections"`
+	MaxDialsPerMinute int    `json:"max_dials_per_minute"`
+	MuxEnabled        bool   `json:"mux_enabled"`
+	Streams           int    `json:"streams"`
 }
 
 type caseResult struct {
@@ -81,15 +82,15 @@ func main() {
 		{Name: "mux_off_s4", MuxEnabled: false, Streams: 4},
 		{Name: "c1_m0_s4", MuxEnabled: true, Concurrency: 1, MaxConnections: 0, Streams: 4},
 		{Name: "c2_m0_s4", MuxEnabled: true, Concurrency: 2, MaxConnections: 0, Streams: 4},
-		{Name: "c4_m0_s4", MuxEnabled: true, Concurrency: 4, MaxConnections: 0, Streams: 4},
 		{Name: "c8_m0_s4", MuxEnabled: true, Concurrency: 8, MaxConnections: 0, Streams: 4},
-		{Name: "c16_m0_s4", MuxEnabled: true, Concurrency: 16, MaxConnections: 0, Streams: 4},
 		{Name: "c8_m1_s4", MuxEnabled: true, Concurrency: 8, MaxConnections: 1, Streams: 4},
 		{Name: "c8_m2_s4", MuxEnabled: true, Concurrency: 8, MaxConnections: 2, Streams: 4},
 		{Name: "c8_m3_s4", MuxEnabled: true, Concurrency: 8, MaxConnections: 3, Streams: 4},
+		{Name: "c4_m3_r3_s4", MuxEnabled: true, Concurrency: 4, MaxConnections: 3, MaxDialsPerMinute: 3, Streams: 4},
+		{Name: "c8_m3_r3_s8", MuxEnabled: true, Concurrency: 8, MaxConnections: 3, MaxDialsPerMinute: 3, Streams: 8},
+		{Name: "c8_m3_r1_s8", MuxEnabled: true, Concurrency: 8, MaxConnections: 3, MaxDialsPerMinute: 1, Streams: 8},
 		{Name: "c2_m0_s8", MuxEnabled: true, Concurrency: 2, MaxConnections: 0, Streams: 8},
 		{Name: "c8_m0_s8", MuxEnabled: true, Concurrency: 8, MaxConnections: 0, Streams: 8},
-		{Name: "c16_m1_s8", MuxEnabled: true, Concurrency: 16, MaxConnections: 1, Streams: 8},
 	}
 
 	sum := summary{
@@ -229,7 +230,10 @@ func runCase(xrayBin string, cfg configCase, payloadMB, rttMs int) (res caseResu
 	}
 	if cfg.MuxEnabled {
 		opt.XrayMux = outbound.XrayMuxOption{
-			Enabled: true, Concurrency: cfg.Concurrency, MaxConnections: cfg.MaxConnections,
+			Enabled:           true,
+			Concurrency:       cfg.Concurrency,
+			MaxConnections:    cfg.MaxConnections,
+			MaxDialsPerMinute: cfg.MaxDialsPerMinute,
 		}
 	}
 	v, err := outbound.NewVless(opt)
@@ -514,24 +518,26 @@ func renderMarkdown(sum summary) string {
 	b.WriteString("# xray-mux local bench\n\n")
 	fmt.Fprintf(&b, "- started: `%s`\n- payload/stream: **%d MiB**\n- simulated RTT: **%d ms**\n- GOMAXPROCS: %d\n\n",
 		sum.StartedAt, sum.PayloadMB, sum.RTTMs, sum.GOMAXPROCS)
-	b.WriteString("| case | streams | conc | max-conn | dials | Mbps | peak RSS client | peak RSS xray | CPU s | ok |\n")
-	b.WriteString("|---|---:|---:|---:|---:|---:|---:|---:|---:|---|\n")
+	b.WriteString("| case | streams | conc | max-conn | dial/min | dials | Mbps | peak RSS client | peak RSS xray | CPU s | ok |\n")
+	b.WriteString("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n")
 	for _, r := range sum.Results {
 		c := r.Config
-		conc, maxc := "-", "-"
+		conc, maxc, rate := "-", "-", "-"
 		if c.MuxEnabled {
 			conc = strconv.Itoa(c.Concurrency)
 			maxc = strconv.Itoa(c.MaxConnections)
+			rate = strconv.Itoa(c.MaxDialsPerMinute)
 		} else {
 			conc = "off"
 			maxc = "off"
+			rate = "off"
 		}
 		ok := "yes"
 		if !r.OK {
 			ok = "NO: " + r.Error
 		}
-		fmt.Fprintf(&b, "| %s | %d | %s | %s | %d | %.1f | %s | %s | %.2f | %s |\n",
-			c.Name, c.Streams, conc, maxc, r.PhysicalDials, r.Mbps,
+		fmt.Fprintf(&b, "| %s | %d | %s | %s | %s | %d | %.1f | %s | %s | %.2f | %s |\n",
+			c.Name, c.Streams, conc, maxc, rate, r.PhysicalDials, r.Mbps,
 			humanBytes(r.PeakClientRSS), humanBytes(r.PeakXrayRSS), r.ClientCPUSec, ok)
 	}
 	b.WriteString("\nNotes:\n")

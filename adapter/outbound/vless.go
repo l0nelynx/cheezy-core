@@ -94,10 +94,11 @@ type VlessOption struct {
 }
 
 type XrayMuxOption struct {
-	Enabled        bool `proxy:"enabled,omitempty"`
-	Concurrency    int  `proxy:"concurrency,omitempty"`
-	MaxConnections int  `proxy:"max-connections,omitempty"`
-	MaxWorkerUses  int  `proxy:"max-worker-uses,omitempty"`
+	Enabled           bool `proxy:"enabled,omitempty"`
+	Concurrency       int  `proxy:"concurrency,omitempty"`
+	MaxConnections    int  `proxy:"max-connections,omitempty"`
+	MaxWorkerUses     int  `proxy:"max-worker-uses,omitempty"`
+	MaxDialsPerMinute int  `proxy:"max-dials-per-minute,omitempty"` // handshake budget; 0=unlimited
 }
 
 type XHTTPOptions struct {
@@ -539,6 +540,9 @@ func NewVless(option VlessOption) (*Vless, error) {
 	}
 	if option.XrayMux.MaxWorkerUses < 0 {
 		return nil, errors.New("xray-mux max-worker-uses must not be negative")
+	}
+	if option.XrayMux.MaxDialsPerMinute < 0 {
+		return nil, errors.New("xray-mux max-dials-per-minute must not be negative")
 	}
 	var addons *vless.Addons
 	if len(option.Flow) >= 16 {
@@ -990,9 +994,10 @@ func NewVless(option VlessOption) (*Vless, error) {
 
 	if option.XrayMux.Enabled {
 		v.xrayMux = xraymux.NewPool(xraymux.Options{
-			Concurrency:    option.XrayMux.Concurrency,
-			MaxConnections: option.XrayMux.MaxConnections,
-			MaxWorkerUses:  option.XrayMux.MaxWorkerUses,
+			Concurrency:       option.XrayMux.Concurrency,
+			MaxConnections:    option.XrayMux.MaxConnections,
+			MaxWorkerUses:     option.XrayMux.MaxWorkerUses,
+			MaxDialsPerMinute: option.XrayMux.MaxDialsPerMinute,
 		}, v.dialXrayMux, v.xrayMuxEndpointKey)
 	}
 
