@@ -319,14 +319,193 @@ func TestConcurrentDialDoesNotSerializeOnExistingWorker(t *testing.T) {
 	}
 }
 
-func TestSessionPipeLimitMatchesXraySessionBuffer(t *testing.T) {
-	// Guard against reintroducing the 64KiB mis-copy of xray's *worker* pipe
-	// limit as the per-session download window (that capped speed at ~window/RTT).
-	if sessionPipeLimit < 512*1024 {
-		t.Fatalf("sessionPipeLimit=%d, want >= 512KiB (xray PerConnection)", sessionPipeLimit)
+func TestResolveBufferConfigDefaults(t *testing.T) {
+	cfg := resolveBufferConfig(Options{})
+	if cfg.sessionBuffer != defaultSessionBuffer {
+		t.Fatalf("sessionBuffer=%d, want %d", cfg.sessionBuffer, defaultSessionBuffer)
 	}
-	if workerReadBuffer < 64*1024 {
-		t.Fatalf("workerReadBuffer=%d, want >= 64KiB", workerReadBuffer)
+	if cfg.sessionMaxBuffer != defaultSessionMaxBuffer {
+		t.Fatalf("sessionMaxBuffer=%d, want %d", cfg.sessionMaxBuffer, defaultSessionMaxBuffer)
+	}
+	if cfg.carrierBuffer != defaultCarrierBuffer {
+		t.Fatalf("carrierBuffer=%d, want %d", cfg.carrierBuffer, defaultCarrierBuffer)
+	}
+	if cfg.workerReadBuffer != defaultWorkerReadBuffer {
+		t.Fatalf("workerReadBuffer=%d, want %d", cfg.workerReadBuffer, defaultWorkerReadBuffer)
+	}
+}
+
+func TestResolveBufferConfigClamps(t *testing.T) {
+	cfg := resolveBufferConfig(Options{
+		SessionBuffer:    1024,
+		SessionMaxBuffer: 512, // below soft → clamp up
+		CarrierBuffer:    256, // below max → clamp up
+	})
+	if cfg.sessionMaxBuffer != 1024 {
+		t.Fatalf("sessionMaxBuffer=%d, want 1024", cfg.sessionMaxBuffer)
+	}
+	if cfg.carrierBuffer != 1024 {
+		t.Fatalf("carrierBuffer=%d, want 1024", cfg.carrierBuffer)
+	}
+}
+
+func writeKeepData(conn net.Conn, id uint16, payload []byte) error {
+	meta, err := encodeMetadata(id, statusKeep, optionData, nil, nil)
+	if err != nil {
+		return err
+	}
+	var size [2]byte
+	binary.BigEndian.PutUint16(size[:], uint16(len(payload)))
+	buffers := net.Buffers{meta, size[:], payload}
+	_, err = buffers.WriteTo(conn)
+	return err
+}
+
+func TestDemuxIsolationDeliversSiblingWhilePeerFull(t *testing.T) {
+	// Soft-full session A must not block demux from delivering to B when
+	// session-max allows overflow parking.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	serverReady := make(chan net.Conn, 1)
+	go func() {
+		server, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		serverReady <- server
+	}()
+
+	pool := NewPool(Options{
+		Concurrency:      2,
+		SessionBuffer:    4 * 1024,
+		SessionMaxBuffer: 32 * 1024,
+		CarrierBuffer:    64 * 1024,
+	}, func(context.Context) (net.Conn, error) {
+		return net.Dial("tcp", ln.Addr().String())
+	}, func(context.Context) string { return "iso:443" })
+	defer pool.Close()
+
+	a, err := pool.DialContext(context.Background(), testTarget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := pool.DialContext(context.Background(), testTarget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	server := <-serverReady
+	defer server.Close()
+	idA, _, _, err := readMetadata(server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idB, _, _, err := readMetadata(server)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	chunk := bytes.Repeat([]byte("A"), 4*1024)
+	if err := writeKeepData(server, idA, chunk); err != nil { // fills soft pipe
+		t.Fatal(err)
+	}
+	if err := writeKeepData(server, idA, chunk); err != nil { // parks in overflow
+		t.Fatal(err)
+	}
+	wantB := []byte("B-PAYLOAD")
+	if err := writeKeepData(server, idB, wantB); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = b.SetReadDeadline(time.Now().Add(2 * time.Second))
+	got := make([]byte, len(wantB))
+	if _, err := io.ReadFull(b, got); err != nil {
+		t.Fatalf("session B blocked by full peer A: %v", err)
+	}
+	if !bytes.Equal(got, wantB) {
+		t.Fatalf("got %q, want %q", got, wantB)
+	}
+}
+
+func TestDemuxXrayLikeModeBlocksSiblingWhenSessionMaxEqualsSoft(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	serverReady := make(chan net.Conn, 1)
+	go func() {
+		server, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		serverReady <- server
+	}()
+
+	pool := NewPool(Options{
+		Concurrency:      2,
+		SessionBuffer:    4 * 1024,
+		SessionMaxBuffer: 4 * 1024, // no overflow headroom → xray-like HoL
+		CarrierBuffer:    64 * 1024,
+	}, func(context.Context) (net.Conn, error) {
+		return net.Dial("tcp", ln.Addr().String())
+	}, func(context.Context) string { return "hol:443" })
+	defer pool.Close()
+
+	a, err := pool.DialContext(context.Background(), testTarget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := pool.DialContext(context.Background(), testTarget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	server := <-serverReady
+	defer server.Close()
+	idA, _, _, err := readMetadata(server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idB, _, _, err := readMetadata(server)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	chunk := bytes.Repeat([]byte("A"), 4*1024)
+	if err := writeKeepData(server, idA, chunk); err != nil {
+		t.Fatal(err)
+	}
+	// Next frame for A cannot admit → demux blocks; B frame sits behind it.
+	go func() {
+		_ = writeKeepData(server, idA, chunk)
+		_ = writeKeepData(server, idB, []byte("B"))
+	}()
+
+	_ = b.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	buf := make([]byte, 8)
+	if _, err := b.Read(buf); err == nil {
+		t.Fatal("expected B to be blocked while A holds demux (xray-like mode)")
+	}
+
+	// Drain A soft pipe → admit unblocks → B should arrive.
+	_ = a.SetReadDeadline(time.Now().Add(2 * time.Second))
+	drain := make([]byte, 4*1024)
+	if _, err := io.ReadFull(a, drain); err != nil {
+		t.Fatal(err)
+	}
+	_ = b.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(b, buf[:1]); err != nil {
+		t.Fatalf("B should arrive after A drain: %v", err)
 	}
 }
 
@@ -356,11 +535,7 @@ func TestPipeBackpressureDoesNotKillDownload(t *testing.T) {
 			return
 		}
 		for i := 0; i < frames; i++ {
-			meta, _ := encodeMetadata(1, statusKeep, optionData, nil, nil)
-			var size [2]byte
-			binary.BigEndian.PutUint16(size[:], uint16(len(payload)))
-			buffers := net.Buffers{meta, size[:], payload}
-			if _, err := buffers.WriteTo(server); err != nil {
+			if err := writeKeepData(server, 1, payload); err != nil {
 				serverDone <- err
 				return
 			}
