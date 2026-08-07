@@ -9,4 +9,5 @@ Stable line: pack-first pool, 512KiB session download pipe, blocking backpressur
 ```bash
 go test ./adapter/outbound/xraymux/ -count=1
 go test ./adapter/outbound/ -run XrayMux -count=1
+XRAY_BIN=/path/to/xray go run ./hack/xraymux-bench -payload-mb 12 -rtt-ms 80 -out /tmp/mux-bench.json
 ```
