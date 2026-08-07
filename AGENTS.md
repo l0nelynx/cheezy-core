@@ -2,13 +2,11 @@
 
 ## Xray Mux
 
-Client Mux.Cool for raw TCP VLESS+REALITY: `adapter/outbound/xraymux`. YAML, spread-first carriers, and LTE tradeoffs: [`docs/xray-mux.md`](docs/xray-mux.md).
+Client Mux.Cool for raw TCP VLESS+REALITY: `adapter/outbound/xraymux`. See [`docs/xray-mux.md`](docs/xray-mux.md).
 
-On mobile prefer `max-connections: 2`–`3` (not `1`) with moderate `concurrency` — one carrier cannot fix TCP HoL for multi-stream speedtests.
+Stable line: pack-first pool, 512KiB session download pipe, blocking backpressure (no session kill on full). Demux-isolation / spread-first were reverted after field regression (1–2 Mbps / connection failures).
 
 ```bash
 go test ./adapter/outbound/xraymux/ -count=1
 go test ./adapter/outbound/ -run XrayMux -count=1
 ```
-
-Do not reintroduce: killing a session when its download pipe is full; a 64KiB per-session pipe; multi‑MiB default overflow that bufferbloats LTE.
