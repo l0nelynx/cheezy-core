@@ -98,12 +98,6 @@ type XrayMuxOption struct {
 	Concurrency    int  `proxy:"concurrency,omitempty"`
 	MaxConnections int  `proxy:"max-connections,omitempty"`
 	MaxWorkerUses  int  `proxy:"max-worker-uses,omitempty"`
-
-	// Demux isolation buffers in bytes; 0 -> xraymux defaults (see docs/xray-mux.md).
-	SessionBuffer    int `proxy:"session-buffer,omitempty"`
-	SessionMaxBuffer int `proxy:"session-max-buffer,omitempty"`
-	CarrierBuffer    int `proxy:"carrier-buffer,omitempty"`
-	WorkerReadBuffer int `proxy:"worker-read-buffer,omitempty"`
 }
 
 type XHTTPOptions struct {
@@ -545,18 +539,6 @@ func NewVless(option VlessOption) (*Vless, error) {
 	}
 	if option.XrayMux.MaxWorkerUses < 0 {
 		return nil, errors.New("xray-mux max-worker-uses must not be negative")
-	}
-	if option.XrayMux.SessionBuffer < 0 {
-		return nil, errors.New("xray-mux session-buffer must not be negative")
-	}
-	if option.XrayMux.SessionMaxBuffer < 0 {
-		return nil, errors.New("xray-mux session-max-buffer must not be negative")
-	}
-	if option.XrayMux.CarrierBuffer < 0 {
-		return nil, errors.New("xray-mux carrier-buffer must not be negative")
-	}
-	if option.XrayMux.WorkerReadBuffer < 0 {
-		return nil, errors.New("xray-mux worker-read-buffer must not be negative")
 	}
 	var addons *vless.Addons
 	if len(option.Flow) >= 16 {
@@ -1008,13 +990,9 @@ func NewVless(option VlessOption) (*Vless, error) {
 
 	if option.XrayMux.Enabled {
 		v.xrayMux = xraymux.NewPool(xraymux.Options{
-			Concurrency:      option.XrayMux.Concurrency,
-			MaxConnections:   option.XrayMux.MaxConnections,
-			MaxWorkerUses:    option.XrayMux.MaxWorkerUses,
-			SessionBuffer:    option.XrayMux.SessionBuffer,
-			SessionMaxBuffer: option.XrayMux.SessionMaxBuffer,
-			CarrierBuffer:    option.XrayMux.CarrierBuffer,
-			WorkerReadBuffer: option.XrayMux.WorkerReadBuffer,
+			Concurrency:    option.XrayMux.Concurrency,
+			MaxConnections: option.XrayMux.MaxConnections,
+			MaxWorkerUses:  option.XrayMux.MaxWorkerUses,
 		}, v.dialXrayMux, v.xrayMuxEndpointKey)
 	}
 

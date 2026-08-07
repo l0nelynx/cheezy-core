@@ -10,7 +10,6 @@ import (
 	"net"
 	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/metacubex/mihomo/common/pool"
@@ -32,16 +31,17 @@ const (
 	maxMetadataSize      = 512
 	defaultMaxUses       = 128
 	defaultConcurrency   = 8
-	// session soft pipe follows xray-core policy.Buffer.PerConnection (512KiB).
-	// session-max defaults to the same size so overflow is opt-in via YAML —
-	// large default overflow+carrier (2MiB/4MiB) caused LTE bufferbloat and
-	// collapsed multi-stream downloads to ~1–2Mbps on a single carrier.
-	defaultSessionBuffer    = 512 * 1024
-	defaultSessionMaxBuffer = 512 * 1024
-	defaultCarrierBuffer    = 1024 * 1024
-	defaultWorkerReadBuffer = 64 * 1024
-	hardConcurrencyMult     = 4
-	workerIdleTime          = 16 * time.Second
+	// Per-session download window. xray-core's 64KiB pipe.WithSizeLimit is the
+	// *worker carrier* cushion between TLS and demux — not the app buffer.
+	// Session output there defaults to policy.Buffer.PerConnection (512KiB on
+	// amd64). Matching the carrier limit here capped bulk download at ~window/RTT
+	// (~60Mbps @ ~8ms) after the initial socket-buffer burst.
+	sessionPipeLimit = 512 * 1024
+	// Userspace cushion on the physical downlink so a brief session push stall
+	// does not immediately starve the TCP receive window (xray worker pipe size).
+	workerReadBuffer    = 64 * 1024
+	hardConcurrencyMult = 4
+	workerIdleTime      = 16 * time.Second
 )
 
 var (
@@ -56,53 +56,6 @@ type Options struct {
 	Concurrency    int // soft streams/worker; 0 -> 8
 	MaxConnections int // physical carriers; 0 -> unlimited
 	MaxWorkerUses  int // retire worker after N sessions; 0 -> 128
-
-	// Demux isolation buffers (bytes). 0 -> package defaults.
-	SessionBuffer    int // soft per-session pipe
-	SessionMaxBuffer int // hard per-session (pipe + overflow)
-	CarrierBuffer    int // hard sum of buffered bytes on one worker
-	WorkerReadBuffer int // bufio size on demux reader
-}
-
-// bufferConfig is the resolved downlink buffering policy for a pool/worker.
-type bufferConfig struct {
-	sessionBuffer    int
-	sessionMaxBuffer int
-	carrierBuffer    int
-	workerReadBuffer int
-}
-
-// resolveBufferConfig applies defaults and clamps invariants:
-// sessionMax >= sessionBuffer, carrier >= sessionMax.
-func resolveBufferConfig(opts Options) bufferConfig {
-	sessionBuf := opts.SessionBuffer
-	if sessionBuf <= 0 {
-		sessionBuf = defaultSessionBuffer
-	}
-	sessionMax := opts.SessionMaxBuffer
-	if sessionMax <= 0 {
-		sessionMax = defaultSessionMaxBuffer
-	}
-	if sessionMax < sessionBuf {
-		sessionMax = sessionBuf
-	}
-	carrier := opts.CarrierBuffer
-	if carrier <= 0 {
-		carrier = defaultCarrierBuffer
-	}
-	if carrier < sessionMax {
-		carrier = sessionMax
-	}
-	workerRead := opts.WorkerReadBuffer
-	if workerRead <= 0 {
-		workerRead = defaultWorkerReadBuffer
-	}
-	return bufferConfig{
-		sessionBuffer:    sessionBuf,
-		sessionMaxBuffer: sessionMax,
-		carrierBuffer:    carrier,
-		workerReadBuffer: workerRead,
-	}
 }
 
 // Pool multiplexes logical TCP connections over Xray Mux.Cool workers.
@@ -113,7 +66,6 @@ type Pool struct {
 	hardConcurrency int
 	maxConnections  int
 	maxWorkerUses   int
-	buf             bufferConfig
 	dial            physicalDialer
 	endpointKey     endpointKeyer
 	closed          bool
@@ -139,7 +91,6 @@ func NewPool(opts Options, dial physicalDialer, endpointKey endpointKeyer) *Pool
 		hardConcurrency: hard,
 		maxConnections:  opts.MaxConnections,
 		maxWorkerUses:   maxUses,
-		buf:             resolveBufferConfig(opts),
 		dial:            dial,
 		endpointKey:     endpointKey,
 	}
@@ -168,29 +119,7 @@ func (p *Pool) dialSession(ctx context.Context, metadata *C.Metadata, globalID *
 			return nil, err
 		}
 
-		// 1) Spread-first when max-connections is capped: open a new REALITY
-		// carrier before packing soft concurrency. One TCP shared by many bulk
-		// downloads collapses on LTE (single cwnd + TCP HoL); a few carriers
-		// keep handshake count low while restoring throughput.
-		if p.underMaxConnections() {
-			w, err := p.dialWorker(ctx, true)
-			if err == nil {
-				s := w.reserve(p.concurrency)
-				if s == nil {
-					continue
-				}
-				if err := w.openSession(s, metadata, globalID); err != nil {
-					return nil, err
-				}
-				return s, nil
-			}
-			if !errors.Is(err, errMaxConnections) {
-				return nil, err
-			}
-			// Lost the race to the last permit — fall through to packing.
-		}
-
-		// 2) Soft-allocate onto an existing worker (brief lock, no I/O).
+		// 1) Soft-allocate onto an existing worker (brief lock, no I/O).
 		if s := p.tryReserve(p.concurrency); s != nil {
 			if err := s.worker.openSession(s, metadata, globalID); err != nil {
 				return nil, err
@@ -198,8 +127,8 @@ func (p *Pool) dialSession(ctx context.Context, metadata *C.Metadata, globalID *
 			return s, nil
 		}
 
-		// 3) Dial a new physical carrier (unlimited max-connections, or soft full).
-		w, err := p.dialWorker(ctx, false)
+		// 2) Dial a new physical carrier outside the pool lock (singleflight).
+		w, err := p.dialWorker(ctx)
 		if err == nil {
 			s := w.reserve(p.concurrency)
 			if s == nil {
@@ -215,7 +144,7 @@ func (p *Pool) dialSession(ctx context.Context, metadata *C.Metadata, globalID *
 			return nil, err
 		}
 
-		// 4) At physical limit: pack onto existing carriers up to hard concurrency.
+		// 3) At physical limit: pack onto existing carriers up to hard concurrency.
 		if s := p.tryReserve(p.hardConcurrency); s != nil {
 			if err := s.worker.openSession(s, metadata, globalID); err != nil {
 				return nil, err
@@ -223,26 +152,11 @@ func (p *Pool) dialSession(ctx context.Context, metadata *C.Metadata, globalID *
 			return s, nil
 		}
 
-		// 5) Everything full: wait for a free stream slot (context-cancellable).
+		// 4) Everything full: wait for a free stream slot (context-cancellable).
 		if err := p.waitForSlot(ctx); err != nil {
 			return nil, err
 		}
 	}
-}
-
-// underMaxConnections reports whether another physical carrier may be dialed
-// under a configured max-connections cap. Unlimited (0) uses pack-first instead.
-func (p *Pool) underMaxConnections() bool {
-	if p.maxConnections <= 0 {
-		return false
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.closed {
-		return false
-	}
-	p.pruneLocked()
-	return len(p.workers) < p.maxConnections
 }
 
 func (p *Pool) tryReserve(limit int) *session {
@@ -252,23 +166,12 @@ func (p *Pool) tryReserve(limit int) *session {
 		return nil
 	}
 	p.pruneLocked()
-	// Prefer the least-loaded worker so streams spread across existing carriers.
-	var best *worker
-	bestN := int(^uint(0) >> 1)
 	for _, w := range p.workers {
-		w.mu.Lock()
-		n := len(w.sessions)
-		can := !w.closed && n < limit && int(w.total) < w.maxUses
-		w.mu.Unlock()
-		if can && n < bestN {
-			best = w
-			bestN = n
+		if s := w.reserve(limit); s != nil {
+			return s
 		}
 	}
-	if best == nil {
-		return nil
-	}
-	return best.reserve(limit)
+	return nil
 }
 
 func (p *Pool) pruneLocked() {
@@ -281,7 +184,7 @@ func (p *Pool) pruneLocked() {
 	p.workers = active
 }
 
-func (p *Pool) dialWorker(ctx context.Context, forceNew bool) (*worker, error) {
+func (p *Pool) dialWorker(ctx context.Context) (*worker, error) {
 	key := "_"
 	if p.endpointKey != nil {
 		if k := p.endpointKey(ctx); k != "" {
@@ -289,72 +192,60 @@ func (p *Pool) dialWorker(ctx context.Context, forceNew bool) (*worker, error) {
 		}
 	}
 
-	if forceNew {
-		// Spread-first must not collapse concurrent dials via singleflight —
-		// otherwise speedtest's parallel opens all land on one carrier.
-		return p.dialWorkerOnce(ctx, key, true)
-	}
-
 	v, err, _ := p.dialGroup.Do(key, func() (any, error) {
-		return p.dialWorkerOnce(ctx, key, false)
-	})
-	if err != nil {
-		return nil, err
-	}
-	return v.(*worker), nil
-}
-
-func (p *Pool) dialWorkerOnce(ctx context.Context, key string, forceNew bool) (*worker, error) {
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return nil, net.ErrClosed
-	}
-	p.pruneLocked()
-	if !forceNew {
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return nil, net.ErrClosed
+		}
+		p.pruneLocked()
 		for _, w := range p.workers {
 			if !w.isClosed() && w.hasCapacity(p.concurrency) {
 				p.mu.Unlock()
 				return w, nil
 			}
 		}
-	}
-	permitKey := ""
-	if p.maxConnections > 0 {
-		permitKey = key
-		if !globalPermits.acquire(permitKey, p.maxConnections) {
-			p.mu.Unlock()
-			return nil, errMaxConnections
+		permitKey := ""
+		if p.maxConnections > 0 {
+			permitKey = key
+			if !globalPermits.acquire(permitKey, p.maxConnections) {
+				p.mu.Unlock()
+				return nil, errMaxConnections
+			}
 		}
-	}
-	p.mu.Unlock()
+		p.mu.Unlock()
 
-	physical, err := p.dial(ctx)
-	if err != nil {
-		if permitKey != "" {
-			globalPermits.release(permitKey)
+		physical, err := p.dial(ctx)
+		if err != nil {
+			if permitKey != "" {
+				globalPermits.release(permitKey)
+			}
+			return nil, err
 		}
+
+		release := func() {
+			if permitKey != "" {
+				globalPermits.release(permitKey)
+			}
+			p.signalFree()
+		}
+		w := newWorker(physical, p.maxWorkerUses, release)
+		w.onFree = p.signalFree
+
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			w.close()
+			return nil, net.ErrClosed
+		}
+		p.workers = append(p.workers, w)
+		p.mu.Unlock()
+		return w, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-
-	release := func() {
-		if permitKey != "" {
-			globalPermits.release(permitKey)
-		}
-		p.signalFree()
-	}
-	w := newWorker(physical, p.maxWorkerUses, release, p.buf)
-	w.onFree = p.signalFree
-
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		w.close()
-		return nil, net.ErrClosed
-	}
-	p.workers = append(p.workers, w)
-	p.mu.Unlock()
-	return w, nil
+	return v.(*worker), nil
 }
 
 func (p *Pool) waitForSlot(ctx context.Context) error {
@@ -436,33 +327,26 @@ func (r *permitRegistry) release(key string) {
 }
 
 type worker struct {
-	mu           sync.Mutex
-	writeMu      sync.Mutex
-	bufMu        sync.Mutex
-	bufCond      *sync.Cond
-	conn         net.Conn
-	sessions     map[uint16]*session
-	maxUses      int
-	total        uint16
-	closed       bool
-	shuttingDown atomic.Bool
-	idleTimer    *time.Timer
-	release      func()
-	closeOnce    sync.Once
-	onFree       func()
-	buf          bufferConfig
-	buffered     int // pipe + overflow bytes across all sessions
+	mu        sync.Mutex
+	writeMu   sync.Mutex
+	conn      net.Conn
+	sessions  map[uint16]*session
+	maxUses   int
+	total     uint16
+	closed    bool
+	idleTimer *time.Timer
+	release   func()
+	closeOnce sync.Once
+	onFree    func()
 }
 
-func newWorker(conn net.Conn, maxUses int, release func(), buf bufferConfig) *worker {
+func newWorker(conn net.Conn, maxUses int, release func()) *worker {
 	w := &worker{
 		conn:     conn,
 		sessions: make(map[uint16]*session),
 		maxUses:  maxUses,
 		release:  release,
-		buf:      buf,
 	}
-	w.bufCond = sync.NewCond(&w.bufMu)
 	go w.readLoop()
 	return w
 }
@@ -488,7 +372,7 @@ func (w *worker) reserve(limit int) *session {
 	s := &session{
 		id:     w.total,
 		worker: w,
-		pipe:   newSessionPipe(w.buf.sessionBuffer),
+		pipe:   newSessionPipe(sessionPipeLimit),
 		done:   make(chan struct{}),
 	}
 	w.sessions[s.id] = s
@@ -511,7 +395,7 @@ func (w *worker) abandonSession(s *session) {
 	delete(w.sessions, s.id)
 	w.mu.Unlock()
 	s.once.Do(func() {
-		s.dropBuffers()
+		s.pipe.close()
 		close(s.done)
 	})
 	if w.onFree != nil {
@@ -543,7 +427,6 @@ func (w *worker) isClosed() bool {
 
 func (w *worker) close() {
 	w.closeOnce.Do(func() {
-		w.shuttingDown.Store(true)
 		w.mu.Lock()
 		w.closed = true
 		if w.idleTimer != nil {
@@ -555,14 +438,9 @@ func (w *worker) close() {
 		}
 		w.sessions = make(map[uint16]*session)
 		w.mu.Unlock()
-
-		w.bufMu.Lock()
-		w.bufCond.Broadcast()
-		w.bufMu.Unlock()
-
 		_ = w.conn.Close()
 		for _, s := range sessions {
-			s.dropBuffers()
+			s.pipe.drop()
 			s.finish(false, false)
 		}
 		if w.release != nil {
@@ -591,7 +469,7 @@ func (w *worker) writeFrame(id uint16, status, option byte, target *C.Metadata, 
 
 func (w *worker) readLoop() {
 	defer w.close()
-	r := bufio.NewReaderSize(w.conn, w.buf.workerReadBuffer)
+	r := bufio.NewReaderSize(w.conn, workerReadBuffer)
 	for {
 		id, status, option, err := readMetadata(r)
 		if err != nil {
@@ -623,9 +501,10 @@ func (w *worker) readLoop() {
 				continue
 			}
 			if len(payload) > 0 {
-				// Admit under session-max / carrier-buffer. Do not tear the
-				// session down on full pipe — that collapsed bulk downloads.
-				if err := s.admit(payload); err != nil {
+				// Block when the per-session pipe is full (TCP backpressure).
+				// Do not tear the session down — that collapsed bulk download
+				// while upload (Write path) kept working.
+				if err := s.push(payload); err != nil {
 					_ = pool.Put(payload)
 				}
 			}
@@ -650,19 +529,6 @@ func (w *worker) readLoop() {
 	}
 }
 
-func (w *worker) releaseBuffered(n int) {
-	if n <= 0 {
-		return
-	}
-	w.bufMu.Lock()
-	w.buffered -= n
-	if w.buffered < 0 {
-		w.buffered = 0
-	}
-	w.bufCond.Broadcast()
-	w.bufMu.Unlock()
-}
-
 type sessionPipe struct {
 	mu     sync.Mutex
 	cond   *sync.Cond
@@ -678,17 +544,23 @@ func newSessionPipe(limit int) *sessionPipe {
 	return p
 }
 
-func (p *sessionPipe) tryWrite(data []byte) bool {
+func (p *sessionPipe) write(data []byte) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	// Soft-close still accepts enqueue so overflow can drain in order after End.
-	if p.nbytes+len(data) <= p.limit {
-		p.chunks = append(p.chunks, data)
-		p.nbytes += len(data)
-		p.cond.Signal()
-		return true
+	for {
+		if p.closed {
+			return net.ErrClosed
+		}
+		if p.nbytes+len(data) <= p.limit {
+			// data is already a pooled buffer owned by the pipe until read consumes it.
+			p.chunks = append(p.chunks, data)
+			p.nbytes += len(data)
+			p.cond.Signal()
+			return nil
+		}
+		// Apply backpressure: wait until the consumer drains enough space.
+		p.cond.Wait()
 	}
-	return false
 }
 
 func (p *sessionPipe) readDeadline(dst []byte, deadline time.Time) (int, error) {
@@ -729,6 +601,7 @@ func (p *sessionPipe) readDeadline(dst []byte, deadline time.Time) (int, error) 
 		p.chunks[0] = left
 	}
 	p.nbytes -= n
+	// Wake a blocked demux writer waiting for pipe space.
 	p.cond.Broadcast()
 	return n, nil
 }
@@ -741,22 +614,22 @@ func (p *sessionPipe) close() {
 	}
 	p.closed = true
 	// Keep buffered chunks so Read can drain in-flight download data after End.
+	// Discarding here truncated speedtest downloads when End arrived before the
+	// consumer emptied the pipe.
 	p.cond.Broadcast()
 }
 
-// drop releases remaining pooled chunks and returns how many bytes were held.
-func (p *sessionPipe) drop() int {
+// drop releases any remaining pooled chunks. Only for hard worker teardown.
+func (p *sessionPipe) drop() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.closed = true
-	n := p.nbytes
 	for _, c := range p.chunks {
 		_ = pool.Put(c)
 	}
 	p.chunks = nil
 	p.nbytes = 0
 	p.cond.Broadcast()
-	return n
 }
 
 type session struct {
@@ -764,8 +637,6 @@ type session struct {
 	worker        *worker
 	target        *C.Metadata
 	pipe          *sessionPipe
-	overflow      [][]byte
-	overflowBytes int
 	done          chan struct{}
 	once          sync.Once
 	readMu        sync.Mutex
@@ -774,72 +645,8 @@ type session struct {
 	writeDeadline time.Time
 }
 
-// admit parks payload into the session pipe or overflow without blocking the
-// demux on a single full soft pipe. Blocks only when session-max or
-// carrier-buffer is exhausted (TCP backpressure).
-func (s *session) admit(payload []byte) error {
-	n := len(payload)
-	if n == 0 {
-		return nil
-	}
-	w := s.worker
-	w.bufMu.Lock()
-	defer w.bufMu.Unlock()
-	for {
-		select {
-		case <-s.done:
-			return net.ErrClosed
-		default:
-		}
-		if w.shuttingDown.Load() {
-			return net.ErrClosed
-		}
-		s.pipe.mu.Lock()
-		sessionTotal := s.pipe.nbytes + s.overflowBytes
-		s.pipe.mu.Unlock()
-		if sessionTotal+n <= w.buf.sessionMaxBuffer && w.buffered+n <= w.buf.carrierBuffer {
-			w.buffered += n
-			if !s.pipe.tryWrite(payload) {
-				s.overflow = append(s.overflow, payload)
-				s.overflowBytes += n
-			}
-			return nil
-		}
-		w.bufCond.Wait()
-	}
-}
-
-func (s *session) flushOverflowToPipe() {
-	w := s.worker
-	w.bufMu.Lock()
-	defer w.bufMu.Unlock()
-	for len(s.overflow) > 0 {
-		chunk := s.overflow[0]
-		if !s.pipe.tryWrite(chunk) {
-			break
-		}
-		s.overflow = s.overflow[1:]
-		s.overflowBytes -= len(chunk)
-	}
-	w.bufCond.Broadcast()
-}
-
-func (s *session) dropBuffers() {
-	w := s.worker
-	w.bufMu.Lock()
-	released := s.pipe.drop()
-	for _, c := range s.overflow {
-		released += len(c)
-		_ = pool.Put(c)
-	}
-	s.overflow = nil
-	s.overflowBytes = 0
-	w.buffered -= released
-	if w.buffered < 0 {
-		w.buffered = 0
-	}
-	w.bufCond.Broadcast()
-	w.bufMu.Unlock()
+func (s *session) push(payload []byte) error {
+	return s.pipe.write(payload)
 }
 
 func (s *session) finish(sendEnd, withError bool) {
@@ -863,30 +670,7 @@ func (s *session) Read(p []byte) (int, error) {
 	}
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
-	deadline := s.getReadDeadline()
-	for {
-		s.flushOverflowToPipe()
-		n, err := s.pipe.readDeadline(p, deadline)
-		if n > 0 {
-			s.worker.releaseBuffered(n)
-			s.flushOverflowToPipe()
-			return n, nil
-		}
-		if err != nil && !errors.Is(err, io.EOF) {
-			return 0, err
-		}
-		s.worker.bufMu.Lock()
-		hasOverflow := len(s.overflow) > 0
-		s.worker.bufMu.Unlock()
-		if hasOverflow {
-			continue
-		}
-		if errors.Is(err, io.EOF) {
-			return 0, io.EOF
-		}
-		// Empty pipe, not closed, no overflow — readDeadline should have waited.
-		return 0, err
-	}
+	return s.pipe.readDeadline(p, s.getReadDeadline())
 }
 
 func (s *session) Write(p []byte) (int, error) {

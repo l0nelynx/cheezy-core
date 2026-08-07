@@ -60,16 +60,6 @@ func TestVlessXrayMuxRejectsNegativeValues(t *testing.T) {
 	if _, err := NewVless(option); err == nil {
 		t.Fatal("expected negative max-worker-uses error")
 	}
-	option = baseXrayMuxVlessOption()
-	option.XrayMux.SessionBuffer = -1
-	if _, err := NewVless(option); err == nil {
-		t.Fatal("expected negative session-buffer error")
-	}
-	option = baseXrayMuxVlessOption()
-	option.XrayMux.CarrierBuffer = -1
-	if _, err := NewVless(option); err == nil {
-		t.Fatal("expected negative carrier-buffer error")
-	}
 }
 
 func TestVlessXrayMuxZeroConcurrencyUsesDefault(t *testing.T) {

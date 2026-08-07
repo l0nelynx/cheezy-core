@@ -1,15 +1,7 @@
-# Дизайн B: изоляция demux HoL в xray-mux
+# Revert demux isolation + spread-first
 
-Полное описание реализации и YAML: [docs/xray-mux.md](../../docs/xray-mux.md).
+Field regression after isolation/spread: connection failures or ≤2 Mbps
+regardless of concurrency/max-connections. Restore client to
+`b541cc33` behavior (512KiB pipe + pack-first + blocking backpressure).
 
-## Статус
-
-Реализовано на `cursor/xray-mux-demux-isolation-9496`.
-
-## Todos
-
-- [x] MD с описанием реализации (`docs/xray-mux.md`)
-- [x] YAML buffers + Pool
-- [x] tryWrite / overflow / carrier wait
-- [x] Тесты изоляции
-- [x] AGENTS.md
+Docs updated accordingly.
