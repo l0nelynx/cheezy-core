@@ -37,11 +37,14 @@ const (
 	// amd64). Matching the carrier limit here capped bulk download at ~window/RTT
 	// (~60Mbps @ ~8ms) after the initial socket-buffer burst.
 	sessionPipeLimit = 512 * 1024
-	// Userspace cushion on the physical downlink so a brief session push stall
-	// does not immediately starve the TCP receive window (xray worker pipe size).
-	workerReadBuffer    = 64 * 1024
-	hardConcurrencyMult = 4
-	workerIdleTime      = 16 * time.Second
+	// Async carrier downlink cushion between TLS/VLESS and demux — same role as
+	// xray-core pipe.WithSizeLimit(64KiB) on the DialingWorkerFactory link.
+	// Sized above xray's 64KiB so brief demux stalls on LTE (~200ms RTT) do not
+	// immediately collapse the TCP window to ~64KiB/RTT (~2.5Mbps).
+	carrierDownlinkLimit = 256 * 1024
+	workerReadBuffer     = 64 * 1024
+	hardConcurrencyMult  = 4
+	workerIdleTime       = 16 * time.Second
 )
 
 var (
@@ -490,6 +493,7 @@ type worker struct {
 	mu        sync.Mutex
 	writeMu   sync.Mutex
 	conn      net.Conn
+	downlink  *sessionPipe // async cushion: TLS reader → demux (xray carrier pipe)
 	sessions  map[uint16]*session
 	maxUses   int
 	total     uint16
@@ -503,10 +507,12 @@ type worker struct {
 func newWorker(conn net.Conn, maxUses int, release func()) *worker {
 	w := &worker{
 		conn:     conn,
+		downlink: newSessionPipe(carrierDownlinkLimit),
 		sessions: make(map[uint16]*session),
 		maxUses:  maxUses,
 		release:  release,
 	}
+	go w.carrierFill()
 	go w.readLoop()
 	return w
 }
@@ -599,6 +605,9 @@ func (w *worker) close() {
 		w.sessions = make(map[uint16]*session)
 		w.mu.Unlock()
 		_ = w.conn.Close()
+		if w.downlink != nil {
+			w.downlink.drop()
+		}
 		for _, s := range sessions {
 			s.pipe.drop()
 			s.finish(false, false)
@@ -627,9 +636,30 @@ func (w *worker) writeFrame(id uint16, status, option byte, target *C.Metadata, 
 	return err
 }
 
+// carrierFill continuously drains the physical TLS/VLESS conn into downlink so
+// demux backpressure does not immediately stop socket Reads (xray DialingWorkerFactory).
+func (w *worker) carrierFill() {
+	defer w.downlink.close()
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := w.conn.Read(buf)
+		if n > 0 {
+			chunk := pool.Get(n)
+			copy(chunk, buf[:n])
+			if werr := w.downlink.write(chunk); werr != nil {
+				_ = pool.Put(chunk)
+				break
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+}
+
 func (w *worker) readLoop() {
 	defer w.close()
-	r := bufio.NewReaderSize(w.conn, workerReadBuffer)
+	r := bufio.NewReaderSize(&pipeReader{p: w.downlink}, workerReadBuffer)
 	for {
 		id, status, option, err := readMetadata(r)
 		if err != nil {
@@ -662,8 +692,7 @@ func (w *worker) readLoop() {
 			}
 			if len(payload) > 0 {
 				// Block when the per-session pipe is full (TCP backpressure).
-				// Do not tear the session down — that collapsed bulk download
-				// while upload (Write path) kept working.
+				// CarrierFill keeps draining TLS into downlink meanwhile.
 				if err := s.push(payload); err != nil {
 					_ = pool.Put(payload)
 				}
@@ -679,7 +708,6 @@ func (w *worker) readLoop() {
 			if payload != nil {
 				_ = pool.Put(payload)
 			}
-			// Xray clients discard unsolicited heartbeat/reverse data.
 		default:
 			if payload != nil {
 				_ = pool.Put(payload)
@@ -687,6 +715,15 @@ func (w *worker) readLoop() {
 			return
 		}
 	}
+}
+
+// pipeReader adapts sessionPipe to io.Reader for bufio demux.
+type pipeReader struct {
+	p *sessionPipe
+}
+
+func (r *pipeReader) Read(b []byte) (int, error) {
+	return r.p.readDeadline(b, time.Time{})
 }
 
 type sessionPipe struct {
@@ -749,6 +786,20 @@ func (p *sessionPipe) readDeadline(dst []byte, deadline time.Time) (int, error) 
 	if len(p.chunks) == 0 {
 		return 0, io.EOF
 	}
+	return p.readLocked(dst), nil
+}
+
+// readAvailable copies any already-queued bytes without blocking.
+func (p *sessionPipe) readAvailable(dst []byte) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.chunks) == 0 {
+		return 0
+	}
+	return p.readLocked(dst)
+}
+
+func (p *sessionPipe) readLocked(dst []byte) int {
 	chunk := p.chunks[0]
 	n := copy(dst, chunk)
 	if n == len(chunk) {
@@ -761,9 +812,8 @@ func (p *sessionPipe) readDeadline(dst []byte, deadline time.Time) (int, error) 
 		p.chunks[0] = left
 	}
 	p.nbytes -= n
-	// Wake a blocked demux writer waiting for pipe space.
 	p.cond.Broadcast()
-	return n, nil
+	return n
 }
 
 func (p *sessionPipe) close() {
@@ -830,7 +880,20 @@ func (s *session) Read(p []byte) (int, error) {
 	}
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
-	return s.pipe.readDeadline(p, s.getReadDeadline())
+	n, err := s.pipe.readDeadline(p, s.getReadDeadline())
+	if n == 0 {
+		return 0, err
+	}
+	// Drain further queued chunks into the caller's buffer without blocking
+	// (closer to xray MultiBuffer session reads).
+	for n < len(p) {
+		m := s.pipe.readAvailable(p[n:])
+		if m == 0 {
+			break
+		}
+		n += m
+	}
+	return n, nil
 }
 
 func (s *session) Write(p []byte) (int, error) {
