@@ -437,6 +437,9 @@ func TestSessionPipeLimitMatchesXraySessionBuffer(t *testing.T) {
 	if sessionPipeLimit < 512*1024 {
 		t.Fatalf("sessionPipeLimit=%d, want >= 512KiB (xray PerConnection)", sessionPipeLimit)
 	}
+	if carrierDownlinkLimit < 64*1024 {
+		t.Fatalf("carrierDownlinkLimit=%d, want >= 64KiB (xray carrier pipe)", carrierDownlinkLimit)
+	}
 	if workerReadBuffer < 64*1024 {
 		t.Fatalf("workerReadBuffer=%d, want >= 64KiB", workerReadBuffer)
 	}

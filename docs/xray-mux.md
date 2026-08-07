@@ -59,14 +59,12 @@ XRAY_BIN=/path/to/xray go run ./hack/xraymux-bench \
 
 Вывод: `max-connections: 2–3` включает soft-grow и поднимает dials/скорость; `max-dials-per-minute: 1` принудительно оставляет 1 carrier. Артефакты: `/opt/cursor/artifacts/xraymux-bench/`.
 
-## Что откатили и почему
+## Поведение download path
 
-Эксперименты **не** оправдались в поле:
-
-1. Demux isolation (overflow / carrier-buffer) — сложный admit-path; на практике скорость падала до 1–2 Mbps при любом concurrency
-2. Spread-first при `max-connections > 0` — лишние параллельные REALITY-dial’ы / нестабильность («нет соединения»)
-
-Не возвращать без новой модели и полевых замеров: kill session на полном pipe; per-session pipe 64KiB; сложный overflow-admit по умолчанию.
+- Per-session pipe **512KiB** (как xray `PerConnection`)
+- **Async carrier downlink 256KiB**: отдельная goroutine читает TLS/VLESS → pipe; demux читает из pipe. Как xray `DialingWorkerFactory` (там 64KiB). Без этого backpressure demux сразу останавливал `conn.Read` → на LTE типично ~64KiB/RTT ≈ 2–3 Mbps
+- `session.Read` сливает несколько chunk’ов за вызов (ближе к xray MultiBuffer)
+- Soft-grow / least-loaded / `max-dials-per-minute` — см. выше
 
 ## Тесты
 
