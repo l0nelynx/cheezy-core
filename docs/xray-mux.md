@@ -45,18 +45,19 @@ XRAY_BIN=/path/to/xray go run ./hack/xraymux-bench \
 
 Снимает Mbps, число physical dials, peak RSS клиента/Xray, CPU.
 
-Пример (localhost, VLESS/TCP, userspace RTT≈80ms, **без** REALITY/потерь; netem в среде недоступен — cwnd не моделируется):
+Пример после soft-grow + dial-rate (localhost, VLESS/TCP, userspace RTT≈80ms):
 
-| case | streams | conc | dials | Mbps | RSS cli | RSS xray |
-|---|---:|---:|---:|---:|---|---|
-| mux off | 4 | — | 4 | ~1360 | ~42MiB | ~30MiB |
-| c=1 | 4 | 1 | 4 | ~1360 | ~42MiB | ~36MiB |
-| c=2 | 4 | 2 | 2 | ~755 | ~37MiB | ~35MiB |
-| c≥4 | 4 | 4–16 | **1** | ~394 | ~31MiB | ~33MiB |
-| c=2 | 8 | 2 | 4 | ~1490 | ~51MiB | ~41MiB |
-| c=8 | 8 | 8 | **1** | ~411 | ~34MiB | ~39MiB |
+| case | conc | max-conn | dial/min | dials | Mbps |
+|---|---:|---:|---:|---:|---:|
+| mux off | — | — | — | 4 | ~1384 |
+| c=8 m=0 | 8 | 0 | 0 | 1 | ~395 |
+| c=8 m=1 | 8 | 1 | 0 | 1 | ~396 |
+| c=8 m=2 | 8 | 2 | 0 | **2** | **~758** |
+| c=8 m=3 | 8 | 3 | 0 | **3** | **~758** |
+| c=8 m=3 r=3 s=8 | 8 | 3 | 3 | **3** | **~1036** |
+| c=8 m=3 r=1 s=8 | 8 | 3 | 1 | **1** | ~411 |
 
-Вывод: при pack-first скорость в этом стенде почти линейно следует числу dials. `max-connections: 2/3` при `concurrency: 8` и 4 стримах **не** открывает лишние carrier’ы (soft 8 вмещает всех на одном). Артефакты: `/opt/cursor/artifacts/xraymux-bench/`.
+Вывод: `max-connections: 2–3` включает soft-grow и поднимает dials/скорость; `max-dials-per-minute: 1` принудительно оставляет 1 carrier. Артефакты: `/opt/cursor/artifacts/xraymux-bench/`.
 
 ## Что откатили и почему
 

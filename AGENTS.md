@@ -4,7 +4,7 @@
 
 Client Mux.Cool for raw TCP VLESS+REALITY: `adapter/outbound/xraymux`. See [`docs/xray-mux.md`](docs/xray-mux.md).
 
-Stable line: pack-first pool, 512KiB session download pipe, blocking backpressure (no session kill on full). Demux-isolation / spread-first were reverted after field regression (1–2 Mbps / connection failures).
+Stable line: 512KiB session pipe + blocking backpressure. Pool policy is xmux-inspired soft-grow when `max-connections > 0`, least-loaded packing, and optional `max-dials-per-minute` handshake budget. See [`docs/xray-mux.md`](docs/xray-mux.md).
 
 ```bash
 go test ./adapter/outbound/xraymux/ -count=1
