@@ -32,12 +32,13 @@ const (
 	maxMetadataSize      = 512
 	defaultMaxUses       = 128
 	defaultConcurrency   = 8
-	// Defaults match docs/xray-mux.md. session soft pipe follows xray-core
-	// policy.Buffer.PerConnection (512KiB on amd64), not the 64KiB *worker*
-	// carrier pipe — using 64KiB here capped bulk download at ~window/RTT.
+	// session soft pipe follows xray-core policy.Buffer.PerConnection (512KiB).
+	// session-max defaults to the same size so overflow is opt-in via YAML —
+	// large default overflow+carrier (2MiB/4MiB) caused LTE bufferbloat and
+	// collapsed multi-stream downloads to ~1–2Mbps on a single carrier.
 	defaultSessionBuffer    = 512 * 1024
-	defaultSessionMaxBuffer = 2 * 1024 * 1024
-	defaultCarrierBuffer    = 4 * 1024 * 1024
+	defaultSessionMaxBuffer = 512 * 1024
+	defaultCarrierBuffer    = 1024 * 1024
 	defaultWorkerReadBuffer = 64 * 1024
 	hardConcurrencyMult     = 4
 	workerIdleTime          = 16 * time.Second
@@ -167,7 +168,29 @@ func (p *Pool) dialSession(ctx context.Context, metadata *C.Metadata, globalID *
 			return nil, err
 		}
 
-		// 1) Soft-allocate onto an existing worker (brief lock, no I/O).
+		// 1) Spread-first when max-connections is capped: open a new REALITY
+		// carrier before packing soft concurrency. One TCP shared by many bulk
+		// downloads collapses on LTE (single cwnd + TCP HoL); a few carriers
+		// keep handshake count low while restoring throughput.
+		if p.underMaxConnections() {
+			w, err := p.dialWorker(ctx, true)
+			if err == nil {
+				s := w.reserve(p.concurrency)
+				if s == nil {
+					continue
+				}
+				if err := w.openSession(s, metadata, globalID); err != nil {
+					return nil, err
+				}
+				return s, nil
+			}
+			if !errors.Is(err, errMaxConnections) {
+				return nil, err
+			}
+			// Lost the race to the last permit — fall through to packing.
+		}
+
+		// 2) Soft-allocate onto an existing worker (brief lock, no I/O).
 		if s := p.tryReserve(p.concurrency); s != nil {
 			if err := s.worker.openSession(s, metadata, globalID); err != nil {
 				return nil, err
@@ -175,8 +198,8 @@ func (p *Pool) dialSession(ctx context.Context, metadata *C.Metadata, globalID *
 			return s, nil
 		}
 
-		// 2) Dial a new physical carrier outside the pool lock (singleflight).
-		w, err := p.dialWorker(ctx)
+		// 3) Dial a new physical carrier (unlimited max-connections, or soft full).
+		w, err := p.dialWorker(ctx, false)
 		if err == nil {
 			s := w.reserve(p.concurrency)
 			if s == nil {
@@ -192,7 +215,7 @@ func (p *Pool) dialSession(ctx context.Context, metadata *C.Metadata, globalID *
 			return nil, err
 		}
 
-		// 3) At physical limit: pack onto existing carriers up to hard concurrency.
+		// 4) At physical limit: pack onto existing carriers up to hard concurrency.
 		if s := p.tryReserve(p.hardConcurrency); s != nil {
 			if err := s.worker.openSession(s, metadata, globalID); err != nil {
 				return nil, err
@@ -200,11 +223,26 @@ func (p *Pool) dialSession(ctx context.Context, metadata *C.Metadata, globalID *
 			return s, nil
 		}
 
-		// 4) Everything full: wait for a free stream slot (context-cancellable).
+		// 5) Everything full: wait for a free stream slot (context-cancellable).
 		if err := p.waitForSlot(ctx); err != nil {
 			return nil, err
 		}
 	}
+}
+
+// underMaxConnections reports whether another physical carrier may be dialed
+// under a configured max-connections cap. Unlimited (0) uses pack-first instead.
+func (p *Pool) underMaxConnections() bool {
+	if p.maxConnections <= 0 {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return false
+	}
+	p.pruneLocked()
+	return len(p.workers) < p.maxConnections
 }
 
 func (p *Pool) tryReserve(limit int) *session {
@@ -214,12 +252,23 @@ func (p *Pool) tryReserve(limit int) *session {
 		return nil
 	}
 	p.pruneLocked()
+	// Prefer the least-loaded worker so streams spread across existing carriers.
+	var best *worker
+	bestN := int(^uint(0) >> 1)
 	for _, w := range p.workers {
-		if s := w.reserve(limit); s != nil {
-			return s
+		w.mu.Lock()
+		n := len(w.sessions)
+		can := !w.closed && n < limit && int(w.total) < w.maxUses
+		w.mu.Unlock()
+		if can && n < bestN {
+			best = w
+			bestN = n
 		}
 	}
-	return nil
+	if best == nil {
+		return nil
+	}
+	return best.reserve(limit)
 }
 
 func (p *Pool) pruneLocked() {
@@ -232,7 +281,7 @@ func (p *Pool) pruneLocked() {
 	p.workers = active
 }
 
-func (p *Pool) dialWorker(ctx context.Context) (*worker, error) {
+func (p *Pool) dialWorker(ctx context.Context, forceNew bool) (*worker, error) {
 	key := "_"
 	if p.endpointKey != nil {
 		if k := p.endpointKey(ctx); k != "" {
@@ -240,60 +289,72 @@ func (p *Pool) dialWorker(ctx context.Context) (*worker, error) {
 		}
 	}
 
+	if forceNew {
+		// Spread-first must not collapse concurrent dials via singleflight —
+		// otherwise speedtest's parallel opens all land on one carrier.
+		return p.dialWorkerOnce(ctx, key, true)
+	}
+
 	v, err, _ := p.dialGroup.Do(key, func() (any, error) {
-		p.mu.Lock()
-		if p.closed {
-			p.mu.Unlock()
-			return nil, net.ErrClosed
-		}
-		p.pruneLocked()
+		return p.dialWorkerOnce(ctx, key, false)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.(*worker), nil
+}
+
+func (p *Pool) dialWorkerOnce(ctx context.Context, key string, forceNew bool) (*worker, error) {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil, net.ErrClosed
+	}
+	p.pruneLocked()
+	if !forceNew {
 		for _, w := range p.workers {
 			if !w.isClosed() && w.hasCapacity(p.concurrency) {
 				p.mu.Unlock()
 				return w, nil
 			}
 		}
-		permitKey := ""
-		if p.maxConnections > 0 {
-			permitKey = key
-			if !globalPermits.acquire(permitKey, p.maxConnections) {
-				p.mu.Unlock()
-				return nil, errMaxConnections
-			}
-		}
-		p.mu.Unlock()
-
-		physical, err := p.dial(ctx)
-		if err != nil {
-			if permitKey != "" {
-				globalPermits.release(permitKey)
-			}
-			return nil, err
-		}
-
-		release := func() {
-			if permitKey != "" {
-				globalPermits.release(permitKey)
-			}
-			p.signalFree()
-		}
-		w := newWorker(physical, p.maxWorkerUses, release, p.buf)
-		w.onFree = p.signalFree
-
-		p.mu.Lock()
-		if p.closed {
+	}
+	permitKey := ""
+	if p.maxConnections > 0 {
+		permitKey = key
+		if !globalPermits.acquire(permitKey, p.maxConnections) {
 			p.mu.Unlock()
-			w.close()
-			return nil, net.ErrClosed
+			return nil, errMaxConnections
 		}
-		p.workers = append(p.workers, w)
-		p.mu.Unlock()
-		return w, nil
-	})
+	}
+	p.mu.Unlock()
+
+	physical, err := p.dial(ctx)
 	if err != nil {
+		if permitKey != "" {
+			globalPermits.release(permitKey)
+		}
 		return nil, err
 	}
-	return v.(*worker), nil
+
+	release := func() {
+		if permitKey != "" {
+			globalPermits.release(permitKey)
+		}
+		p.signalFree()
+	}
+	w := newWorker(physical, p.maxWorkerUses, release, p.buf)
+	w.onFree = p.signalFree
+
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		w.close()
+		return nil, net.ErrClosed
+	}
+	p.workers = append(p.workers, w)
+	p.mu.Unlock()
+	return w, nil
 }
 
 func (p *Pool) waitForSlot(ctx context.Context) error {
