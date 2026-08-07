@@ -94,6 +94,7 @@ func TestEncodeMetadataUDPIncludesGlobalID(t *testing.T) {
 func TestPoolFillsWorkerBeforeOpeningAnother(t *testing.T) {
 	var mu sync.Mutex
 	dials := 0
+	// max-connections=0 → pack-first: fill soft concurrency before dialing another.
 	pool := NewPool(Options{Concurrency: 2}, echoDialer(&dials, &mu), func(context.Context) string { return "test:443" })
 	defer pool.Close()
 
@@ -134,6 +135,117 @@ func TestPoolFillsWorkerBeforeOpeningAnother(t *testing.T) {
 	_ = c1.Close()
 	_ = c2.Close()
 	_ = c3.Close()
+}
+
+func TestPoolGrowsToMaxConnectionsBeforePacking(t *testing.T) {
+	globalPermits = permitRegistry{counts: make(map[string]int)}
+	var mu sync.Mutex
+	dials := 0
+	pool := NewPool(Options{Concurrency: 8, MaxConnections: 3}, echoDialer(&dials, &mu), func(context.Context) string {
+		return "203.0.113.60:443"
+	})
+	defer pool.Close()
+
+	var conns []net.Conn
+	for i := 0; i < 3; i++ {
+		c, err := pool.DialContext(context.Background(), testTarget())
+		if err != nil {
+			t.Fatalf("dial %d: %v", i, err)
+		}
+		conns = append(conns, c)
+	}
+	mu.Lock()
+	if dials != 3 {
+		t.Fatalf("soft-grow opened %d carriers, want 3", dials)
+	}
+	mu.Unlock()
+
+	c4, err := pool.DialContext(context.Background(), testTarget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns = append(conns, c4)
+	mu.Lock()
+	if dials != 3 {
+		t.Fatalf("fourth session should pack, dials=%d", dials)
+	}
+	mu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
+	}
+}
+
+func TestPoolDialRateLimitPacksInsteadOfDialing(t *testing.T) {
+	globalPermits = permitRegistry{counts: make(map[string]int)}
+	var mu sync.Mutex
+	dials := 0
+	pool := NewPool(Options{
+		Concurrency:       8,
+		MaxConnections:    3,
+		MaxDialsPerMinute: 1,
+	}, echoDialer(&dials, &mu), func(context.Context) string {
+		return "203.0.113.61:443"
+	})
+	defer pool.Close()
+
+	c1, err := pool.DialContext(context.Background(), testTarget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+	c2, err := pool.DialContext(context.Background(), testTarget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	mu.Lock()
+	defer mu.Unlock()
+	if dials != 1 {
+		t.Fatalf("rate limit should force pack, dials=%d want 1", dials)
+	}
+}
+
+func TestPoolLeastLoadedSpreadsAcrossCarriers(t *testing.T) {
+	globalPermits = permitRegistry{counts: make(map[string]int)}
+	var mu sync.Mutex
+	dials := 0
+	pool := NewPool(Options{Concurrency: 8, MaxConnections: 2}, echoDialer(&dials, &mu), func(context.Context) string {
+		return "203.0.113.62:443"
+	})
+	defer pool.Close()
+
+	c1, _ := pool.DialContext(context.Background(), testTarget())
+	c2, _ := pool.DialContext(context.Background(), testTarget())
+	// Two carriers, one session each. Next two should land one on each (least-loaded).
+	c3, err := pool.DialContext(context.Background(), testTarget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c4, err := pool.DialContext(context.Background(), testTarget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	if dials != 2 {
+		t.Fatalf("dials=%d want 2", dials)
+	}
+	mu.Unlock()
+
+	pool.mu.Lock()
+	counts := []int{}
+	for _, w := range pool.workers {
+		w.mu.Lock()
+		counts = append(counts, len(w.sessions))
+		w.mu.Unlock()
+	}
+	pool.mu.Unlock()
+	if len(counts) != 2 || counts[0] != 2 || counts[1] != 2 {
+		t.Fatalf("session distribution %v, want [2 2]", counts)
+	}
+	_ = c1.Close()
+	_ = c2.Close()
+	_ = c3.Close()
+	_ = c4.Close()
 }
 
 func TestPoolPacksOverflowInsteadOfDropping(t *testing.T) {

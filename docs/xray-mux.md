@@ -9,32 +9,32 @@ Wire-протокол совместим с **xray-core**.
 ```yaml
 xray-mux:
   enabled: true
-  concurrency: 2            # soft: сколько стримов на один carrier до открытия нового
-  max-connections: 0        # физ. carrier’ов; 0 = без лимита
-  max-worker-uses: 128      # 0 → 128
+  concurrency: 4              # soft streams/carrier after carriers are grown
+  max-connections: 3          # soft-grow target + hard cap (0 = pack-first, unlimited)
+  max-dials-per-minute: 3     # handshake budget; 0 = unlimited
+  max-worker-uses: 128        # 0 → 128
 ```
 
 Только raw TCP VLESS; `flow` / ws / grpc / xhttp → mux тихо выключается.
 
-## Поведение (актуальная стабильная линия)
+## Политика пула (xmux-inspired)
 
-После регрессии demux-isolation / spread-first клиент **откатан** к модели:
-
-- **Pack-first**: сначала заполняется soft `concurrency` на существующем carrier, потом новый
-- Per-session download pipe **512KiB** + `bufio` 64KiB на demux
-- Backpressure при полном pipe (**блок demux**, сессию не рвём)
-
-Это состояние после фиксов download≈0 (kill-on-full) и плато ~60Mbps из‑за окна 64KiB.
-
-### Практические настройки на LTE
-
-| Цель | Конфиг |
+| `max-connections` | Поведение |
 |---|---|
-| Скорость multi-stream | низкий `concurrency` (1–2) → больше физических TCP |
-| Меньше handshake | высокий `concurrency` / `max-connections: 1` → один TCP, скорость ниже |
+| `0` | **Pack-first**: заполняем soft `concurrency`, потом новый dial |
+| `> 0` | **Soft-grow**: пока carrier’ов < max — новый dial (сериализованно); затем **least-loaded** pack; hard = `concurrency×4`; потом wait |
 
-Один TCP не масштабируется на несколько жадных download’ов (одно cwnd + TCP HoL).
+`max-dials-per-minute`: sliding window на новые physical dials. При исчерпании бюджета — pack на существующие, без ожидания новой минуты (если есть soft/hard слот).
 
+### Практические настройки под цензор ≤3 TLS/мин
+
+```yaml
+concurrency: 4
+max-connections: 3
+max-dials-per-minute: 3
+```
+
+Не ставь `max-connections: 1` «ради concurrency» — concurrency тогда почти не влияет на handshake.
 ### Локальный бенч (ядро + Xray)
 
 ```bash
@@ -45,18 +45,19 @@ XRAY_BIN=/path/to/xray go run ./hack/xraymux-bench \
 
 Снимает Mbps, число physical dials, peak RSS клиента/Xray, CPU.
 
-Пример (localhost, VLESS/TCP, userspace RTT≈80ms, **без** REALITY/потерь; netem в среде недоступен — cwnd не моделируется):
+Пример после soft-grow + dial-rate (localhost, VLESS/TCP, userspace RTT≈80ms):
 
-| case | streams | conc | dials | Mbps | RSS cli | RSS xray |
-|---|---:|---:|---:|---:|---|---|
-| mux off | 4 | — | 4 | ~1360 | ~42MiB | ~30MiB |
-| c=1 | 4 | 1 | 4 | ~1360 | ~42MiB | ~36MiB |
-| c=2 | 4 | 2 | 2 | ~755 | ~37MiB | ~35MiB |
-| c≥4 | 4 | 4–16 | **1** | ~394 | ~31MiB | ~33MiB |
-| c=2 | 8 | 2 | 4 | ~1490 | ~51MiB | ~41MiB |
-| c=8 | 8 | 8 | **1** | ~411 | ~34MiB | ~39MiB |
+| case | conc | max-conn | dial/min | dials | Mbps |
+|---|---:|---:|---:|---:|---:|
+| mux off | — | — | — | 4 | ~1384 |
+| c=8 m=0 | 8 | 0 | 0 | 1 | ~395 |
+| c=8 m=1 | 8 | 1 | 0 | 1 | ~396 |
+| c=8 m=2 | 8 | 2 | 0 | **2** | **~758** |
+| c=8 m=3 | 8 | 3 | 0 | **3** | **~758** |
+| c=8 m=3 r=3 s=8 | 8 | 3 | 3 | **3** | **~1036** |
+| c=8 m=3 r=1 s=8 | 8 | 3 | 1 | **1** | ~411 |
 
-Вывод: при pack-first скорость в этом стенде почти линейно следует числу dials. `max-connections: 2/3` при `concurrency: 8` и 4 стримах **не** открывает лишние carrier’ы (soft 8 вмещает всех на одном). Артефакты: `/opt/cursor/artifacts/xraymux-bench/`.
+Вывод: `max-connections: 2–3` включает soft-grow и поднимает dials/скорость; `max-dials-per-minute: 1` принудительно оставляет 1 carrier. Артефакты: `/opt/cursor/artifacts/xraymux-bench/`.
 
 ## Что откатили и почему
 

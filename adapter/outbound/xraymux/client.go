@@ -46,6 +46,7 @@ const (
 
 var (
 	errMaxConnections = errors.New("xray mux: max connections reached")
+	errDialRateLimit  = errors.New("xray mux: dial rate limit")
 )
 
 type physicalDialer func(context.Context) (net.Conn, error)
@@ -54,23 +55,29 @@ type endpointKeyer func(context.Context) string
 // Options configures a Mux.Cool client pool.
 type Options struct {
 	Concurrency    int // soft streams/worker; 0 -> 8
-	MaxConnections int // physical carriers; 0 -> unlimited
+	MaxConnections int // physical carriers; 0 -> unlimited (pack-first)
 	MaxWorkerUses  int // retire worker after N sessions; 0 -> 128
+	// MaxDialsPerMinute caps new physical dials in a sliding 60s window
+	// (handshake budget for censors). 0 -> unlimited.
+	MaxDialsPerMinute int
 }
 
 // Pool multiplexes logical TCP connections over Xray Mux.Cool workers.
 type Pool struct {
-	mu              sync.Mutex
-	workers         []*worker
-	concurrency     int
-	hardConcurrency int
-	maxConnections  int
-	maxWorkerUses   int
-	dial            physicalDialer
-	endpointKey     endpointKeyer
-	closed          bool
-	dialGroup       singleflight.Group
-	free            *sync.Cond
+	mu                sync.Mutex
+	dialMu            sync.Mutex // serializes physical dials (handshake pacing)
+	workers           []*worker
+	concurrency       int
+	hardConcurrency   int
+	maxConnections    int
+	maxWorkerUses     int
+	maxDialsPerMinute int
+	dial              physicalDialer
+	endpointKey       endpointKeyer
+	closed            bool
+	dialGroup         singleflight.Group
+	free              *sync.Cond
+	dialTimes         []time.Time // sliding window for MaxDialsPerMinute
 }
 
 func NewPool(opts Options, dial physicalDialer, endpointKey endpointKeyer) *Pool {
@@ -87,12 +94,13 @@ func NewPool(opts Options, dial physicalDialer, endpointKey endpointKeyer) *Pool
 		hard = concurrency
 	}
 	p := &Pool{
-		concurrency:     concurrency,
-		hardConcurrency: hard,
-		maxConnections:  opts.MaxConnections,
-		maxWorkerUses:   maxUses,
-		dial:            dial,
-		endpointKey:     endpointKey,
+		concurrency:       concurrency,
+		hardConcurrency:   hard,
+		maxConnections:    opts.MaxConnections,
+		maxWorkerUses:     maxUses,
+		maxDialsPerMinute: opts.MaxDialsPerMinute,
+		dial:              dial,
+		endpointKey:       endpointKey,
 	}
 	p.free = sync.NewCond(&p.mu)
 	return p
@@ -119,7 +127,27 @@ func (p *Pool) dialSession(ctx context.Context, metadata *C.Metadata, globalID *
 			return nil, err
 		}
 
-		// 1) Soft-allocate onto an existing worker (brief lock, no I/O).
+		// 1) Soft grow (xmux-inspired): while under max-connections, prefer a
+		// new carrier before packing — but only if the dial-rate budget allows.
+		// Physical dials are serialized so parallel opens become 1,2,3… carriers
+		// instead of a handshake storm.
+		if p.wantGrow() {
+			w, err := p.dialWorkerNew(ctx)
+			if err == nil {
+				s := w.reserve(p.concurrency)
+				if s != nil {
+					if err := w.openSession(s, metadata, globalID); err != nil {
+						return nil, err
+					}
+					return s, nil
+				}
+			} else if !errors.Is(err, errMaxConnections) && !errors.Is(err, errDialRateLimit) {
+				return nil, err
+			}
+			// Rate-limited or lost the last permit — pack instead.
+		}
+
+		// 2) Soft-allocate onto the least-loaded existing worker.
 		if s := p.tryReserve(p.concurrency); s != nil {
 			if err := s.worker.openSession(s, metadata, globalID); err != nil {
 				return nil, err
@@ -127,12 +155,11 @@ func (p *Pool) dialSession(ctx context.Context, metadata *C.Metadata, globalID *
 			return s, nil
 		}
 
-		// 2) Dial a new physical carrier outside the pool lock (singleflight).
+		// 3) Soft full: dial a new carrier (pack-first path when max-connections=0).
 		w, err := p.dialWorker(ctx)
 		if err == nil {
 			s := w.reserve(p.concurrency)
 			if s == nil {
-				// Another waiter may have filled it; try again.
 				continue
 			}
 			if err := w.openSession(s, metadata, globalID); err != nil {
@@ -140,11 +167,11 @@ func (p *Pool) dialSession(ctx context.Context, metadata *C.Metadata, globalID *
 			}
 			return s, nil
 		}
-		if !errors.Is(err, errMaxConnections) {
+		if !errors.Is(err, errMaxConnections) && !errors.Is(err, errDialRateLimit) {
 			return nil, err
 		}
 
-		// 3) At physical limit: pack onto existing carriers up to hard concurrency.
+		// 4) At physical / rate limit: pack up to hard concurrency (least-loaded).
 		if s := p.tryReserve(p.hardConcurrency); s != nil {
 			if err := s.worker.openSession(s, metadata, globalID); err != nil {
 				return nil, err
@@ -152,11 +179,24 @@ func (p *Pool) dialSession(ctx context.Context, metadata *C.Metadata, globalID *
 			return s, nil
 		}
 
-		// 4) Everything full: wait for a free stream slot (context-cancellable).
+		// 5) Everything full: wait for a free stream slot (context-cancellable).
 		if err := p.waitForSlot(ctx); err != nil {
 			return nil, err
 		}
 	}
+}
+
+func (p *Pool) wantGrow() bool {
+	if p.maxConnections <= 0 {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return false
+	}
+	p.pruneLocked()
+	return len(p.workers) < p.maxConnections
 }
 
 func (p *Pool) tryReserve(limit int) *session {
@@ -166,12 +206,23 @@ func (p *Pool) tryReserve(limit int) *session {
 		return nil
 	}
 	p.pruneLocked()
+	// Least-loaded among workers that still have soft/hard capacity.
+	var best *worker
+	bestN := int(^uint(0) >> 1)
 	for _, w := range p.workers {
-		if s := w.reserve(limit); s != nil {
-			return s
+		w.mu.Lock()
+		n := len(w.sessions)
+		can := !w.closed && n < limit && int(w.total) < w.maxUses
+		w.mu.Unlock()
+		if can && n < bestN {
+			best = w
+			bestN = n
 		}
 	}
-	return nil
+	if best == nil {
+		return nil
+	}
+	return best.reserve(limit)
 }
 
 func (p *Pool) pruneLocked() {
@@ -184,6 +235,100 @@ func (p *Pool) pruneLocked() {
 	p.workers = active
 }
 
+func (p *Pool) dialAllowedLocked(now time.Time) bool {
+	if p.maxDialsPerMinute <= 0 {
+		return true
+	}
+	cutoff := now.Add(-time.Minute)
+	kept := p.dialTimes[:0]
+	for _, t := range p.dialTimes {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	p.dialTimes = kept
+	return len(p.dialTimes) < p.maxDialsPerMinute
+}
+
+func (p *Pool) recordDialLocked(now time.Time) {
+	if p.maxDialsPerMinute <= 0 {
+		return
+	}
+	p.dialTimes = append(p.dialTimes, now)
+}
+
+// dialWorkerNew always opens a new physical carrier (soft-grow path).
+// Dials are serialized on dialMu; fails with errDialRateLimit / errMaxConnections.
+func (p *Pool) dialWorkerNew(ctx context.Context) (*worker, error) {
+	p.dialMu.Lock()
+	defer p.dialMu.Unlock()
+
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil, net.ErrClosed
+	}
+	p.pruneLocked()
+	if p.maxConnections > 0 && len(p.workers) >= p.maxConnections {
+		p.mu.Unlock()
+		return nil, errMaxConnections
+	}
+	now := time.Now()
+	if !p.dialAllowedLocked(now) {
+		p.mu.Unlock()
+		return nil, errDialRateLimit
+	}
+	key := "_"
+	if p.endpointKey != nil {
+		if k := p.endpointKey(ctx); k != "" {
+			key = k
+		}
+	}
+	permitKey := ""
+	if p.maxConnections > 0 {
+		permitKey = key
+		if !globalPermits.acquire(permitKey, p.maxConnections) {
+			p.mu.Unlock()
+			return nil, errMaxConnections
+		}
+	}
+	p.recordDialLocked(now)
+	p.mu.Unlock()
+
+	physical, err := p.dial(ctx)
+	if err != nil {
+		if permitKey != "" {
+			globalPermits.release(permitKey)
+		}
+		// Roll back rate-limit token on failed dial.
+		p.mu.Lock()
+		if n := len(p.dialTimes); n > 0 {
+			p.dialTimes = p.dialTimes[:n-1]
+		}
+		p.mu.Unlock()
+		return nil, err
+	}
+
+	release := func() {
+		if permitKey != "" {
+			globalPermits.release(permitKey)
+		}
+		p.signalFree()
+	}
+	w := newWorker(physical, p.maxWorkerUses, release)
+	w.onFree = p.signalFree
+
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		w.close()
+		return nil, net.ErrClosed
+	}
+	p.workers = append(p.workers, w)
+	p.mu.Unlock()
+	return w, nil
+}
+
 func (p *Pool) dialWorker(ctx context.Context) (*worker, error) {
 	key := "_"
 	if p.endpointKey != nil {
@@ -193,6 +338,10 @@ func (p *Pool) dialWorker(ctx context.Context) (*worker, error) {
 	}
 
 	v, err, _ := p.dialGroup.Do(key, func() (any, error) {
+		// Serialize with grow-path dials so rate limit stays accurate.
+		p.dialMu.Lock()
+		defer p.dialMu.Unlock()
+
 		p.mu.Lock()
 		if p.closed {
 			p.mu.Unlock()
@@ -205,6 +354,11 @@ func (p *Pool) dialWorker(ctx context.Context) (*worker, error) {
 				return w, nil
 			}
 		}
+		now := time.Now()
+		if !p.dialAllowedLocked(now) {
+			p.mu.Unlock()
+			return nil, errDialRateLimit
+		}
 		permitKey := ""
 		if p.maxConnections > 0 {
 			permitKey = key
@@ -213,6 +367,7 @@ func (p *Pool) dialWorker(ctx context.Context) (*worker, error) {
 				return nil, errMaxConnections
 			}
 		}
+		p.recordDialLocked(now)
 		p.mu.Unlock()
 
 		physical, err := p.dial(ctx)
@@ -220,6 +375,11 @@ func (p *Pool) dialWorker(ctx context.Context) (*worker, error) {
 			if permitKey != "" {
 				globalPermits.release(permitKey)
 			}
+			p.mu.Lock()
+			if n := len(p.dialTimes); n > 0 {
+				p.dialTimes = p.dialTimes[:n-1]
+			}
+			p.mu.Unlock()
 			return nil, err
 		}
 
