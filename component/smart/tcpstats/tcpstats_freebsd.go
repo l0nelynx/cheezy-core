@@ -27,12 +27,12 @@ const (
 func readTCPStats(rawConn syscall.RawConn) *Stats {
 	var info tcpPerfInfoFreeBSD
 	var ctrlErr error
+	size := uint32(unsafe.Sizeof(info))
 	rawConn.Control(func(fd uintptr) {
 		if int(fd) <= 2 {
 			ctrlErr = syscall.EBADF
 			return
 		}
-		var size uint32 = uint32(unsafe.Sizeof(info))
 		_, _, errno := syscall.Syscall6(
 			syscall.SYS_GETSOCKOPT,
 			fd,
@@ -46,7 +46,7 @@ func readTCPStats(rawConn syscall.RawConn) *Stats {
 			ctrlErr = errno
 		}
 	})
-	if ctrlErr != nil {
+	if ctrlErr != nil || size < uint32(unsafe.Sizeof(info)) {
 		return nil
 	}
 	return &Stats{
