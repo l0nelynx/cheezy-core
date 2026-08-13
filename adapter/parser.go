@@ -26,6 +26,13 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 		proxy outbound.ProxyAdapter
 		err   error
 	)
+	var singMuxOption *outbound.SingMuxOption
+	if muxMapping, muxExist := mapping["smux"].(map[string]any); muxExist {
+		singMuxOption = &outbound.SingMuxOption{}
+		if err = decoder.Decode(muxMapping, singMuxOption); err != nil {
+			return nil, err
+		}
+	}
 	switch proxyType {
 	case "ss":
 		ssOption := &outbound.ShadowSocksOption{BasicOption: basicOption}
@@ -67,6 +74,9 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 		err = decoder.Decode(mapping, vlessOption)
 		if err != nil {
 			break
+		}
+		if singMuxOption != nil && singMuxOption.Enabled {
+			vlessOption.XrayMux = outbound.XrayMuxOption{}
 		}
 		proxy, err = outbound.NewVless(*vlessOption)
 	case "snell":
@@ -224,14 +234,9 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 		return nil, err
 	}
 
-	if muxMapping, muxExist := mapping["smux"].(map[string]any); muxExist {
-		muxOption := &outbound.SingMuxOption{}
-		err = decoder.Decode(muxMapping, muxOption)
-		if err != nil {
-			return nil, err
-		}
-		if muxOption.Enabled {
-			proxy, err = outbound.NewSingMux(*muxOption, proxy)
+	if singMuxOption != nil {
+		if singMuxOption.Enabled {
+			proxy, err = outbound.NewSingMux(*singMuxOption, proxy)
 			if err != nil {
 				return nil, err
 			}
