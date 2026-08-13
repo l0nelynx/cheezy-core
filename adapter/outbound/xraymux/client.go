@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/common/contextutils"
 	"github.com/metacubex/mihomo/common/pool"
 	C "github.com/metacubex/mihomo/constant"
 
@@ -415,7 +416,7 @@ func (p *Pool) waitForSlot(ctx context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	stop := context.AfterFunc(ctx, func() {
+	stop := contextutils.AfterFunc(ctx, func() {
 		p.mu.Lock()
 		p.free.Broadcast()
 		p.mu.Unlock()
