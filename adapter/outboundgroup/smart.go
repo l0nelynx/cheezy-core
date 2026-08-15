@@ -249,6 +249,20 @@ func (s *Smart) singleDialContext(ctx context.Context, proxy C.Proxy, metadata *
 	return c, connectTime, nil
 }
 
+func (s *Smart) groupDialFailed(proxies []C.Proxy, err error) {
+	if errors.Is(err, context.Canceled) {
+		return
+	}
+	for _, p := range proxies {
+		t := p.Type()
+		if t == C.Direct || t == C.Compatible || t == C.Reject || t == C.Pass || t == C.RejectDrop {
+			continue
+		}
+		s.onDialFailed(t, err, s.healthCheck)
+		return
+	}
+}
+
 func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
 	getBatch := func(proxies []C.Proxy, i int) ([]C.Proxy, time.Duration) {
 		var batch []C.Proxy
@@ -309,11 +323,14 @@ func (s *Smart) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, 
 			} else {
 				s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, []C.Proxy{p})
 				s.closeSameConnection(metadata, p.Name(), metadata.SmartTarget, asnNumber, false)
+				s.onDialSuccess()
 				return s.WrapConnWithMetric(c, p, metadata, connectTime), nil
 			}
 		}
 
 		s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget)
+
+		s.groupDialFailed(proxies, finalErr)
 
 		return nil, finalErr
 	}
@@ -368,6 +385,7 @@ func (s *Smart) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 
 			s.store.StoreUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget, []C.Proxy{proxy})
 			s.closeSameConnection(metadata, proxy.Name(), metadata.SmartTarget, asnNumber, false)
+			s.onDialSuccess()
 			return s.WrapPacketConnWithMetric(pc, proxy, metadata, connectTime), nil
 		}
 
@@ -377,6 +395,8 @@ func (s *Smart) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 	}
 
 	s.store.DeleteUnwrapResult(s.Name(), s.configName, metadata.SmartTarget, asnNumber, metadata.WildcardTarget)
+
+	s.groupDialFailed(proxies, finalErr)
 
 	return nil, finalErr
 }
@@ -1466,10 +1486,8 @@ func (s *Smart) recordConnectionStats(metadata *C.Metadata, proxy C.Proxy,
 
 	switch {
 	case err != nil:
-		s.onDialFailed(proxy.Type(), err, s.healthCheck)
 		atomicRecord.Add("failure", int64(1))
 	default:
-		s.onDialSuccess()
 		atomicRecord.Add("success", int64(1))
 	}
 
