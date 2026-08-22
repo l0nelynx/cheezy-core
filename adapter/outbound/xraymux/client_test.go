@@ -62,6 +62,39 @@ func serveEchoMux(conn net.Conn) {
 	}
 }
 
+func readTestFrame(conn net.Conn) (frameMetadata, []byte, error) {
+	frame, err := readFrameMetadata(conn)
+	if err != nil {
+		return frameMetadata{}, nil, err
+	}
+	if frame.option&optionData == 0 {
+		return frame, nil, nil
+	}
+	var size [2]byte
+	if _, err = io.ReadFull(conn, size[:]); err != nil {
+		return frameMetadata{}, nil, err
+	}
+	payload := make([]byte, binary.BigEndian.Uint16(size[:]))
+	_, err = io.ReadFull(conn, payload)
+	return frame, payload, err
+}
+
+func writeTestFrame(conn net.Conn, id uint16, status, option byte, target *C.Metadata, payload []byte) error {
+	meta, err := encodeMetadata(id, status, option, target, nil)
+	if err != nil {
+		return err
+	}
+	if option&optionData == 0 {
+		_, err = conn.Write(meta)
+		return err
+	}
+	var size [2]byte
+	binary.BigEndian.PutUint16(size[:], uint16(len(payload)))
+	buffers := net.Buffers{meta, size[:], payload}
+	_, err = buffers.WriteTo(conn)
+	return err
+}
+
 func TestEncodeMetadataMatchesMuxCoolLayout(t *testing.T) {
 	frame, err := encodeMetadata(7, statusNew, 0, testTarget(), nil)
 	if err != nil {
@@ -319,6 +352,171 @@ func TestEndPayloadIsDrainedBeforeTerminalError(t *testing.T) {
 	var protocolErr *ProtocolError
 	if !errors.As(err, &protocolErr) {
 		t.Fatalf("terminal error = %T %v, want *ProtocolError", err, err)
+	}
+}
+
+func TestPacketSessionPreservesDatagramsAndDestinations(t *testing.T) {
+	globalID := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
+	observed := make(chan struct {
+		frame   frameMetadata
+		payload string
+	}, 2)
+	serverErr := make(chan error, 1)
+	pool := NewPool(Options{Concurrency: 16}, func(context.Context) (net.Conn, error) {
+		client, server := net.Pipe()
+		go func() {
+			defer server.Close()
+			for i := 0; i < 2; i++ {
+				frame, payload, err := readTestFrame(server)
+				if err != nil {
+					serverErr <- err
+					return
+				}
+				observed <- struct {
+					frame   frameMetadata
+					payload string
+				}{frame: frame, payload: string(payload)}
+			}
+			responses := []struct {
+				target  *C.Metadata
+				payload string
+			}{
+				{target: &C.Metadata{NetWork: C.UDP, Host: "reply.example", DstPort: 5300}, payload: "alpha"},
+				{target: &C.Metadata{NetWork: C.UDP, DstIP: netip.MustParseAddr("8.8.4.4"), DstPort: 5353}, payload: "beta"},
+			}
+			for _, response := range responses {
+				if err := writeTestFrame(server, 1, statusKeep, optionData, response.target, []byte(response.payload)); err != nil {
+					serverErr <- err
+					return
+				}
+			}
+			serverErr <- writeTestFrame(server, 1, statusEnd, 0, nil, nil)
+		}()
+		return client, nil
+	}, func(context.Context) string { return "xudp:443" })
+	defer pool.Close()
+
+	packetConn, err := pool.ListenPacketContext(context.Background(), &C.Metadata{
+		NetWork: C.UDP, Host: "initial.example", DstPort: 53,
+	}, globalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer packetConn.Close()
+	if _, err = packetConn.WriteTo([]byte("one"), domainPacketAddr{host: "first.example", port: 1000}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = packetConn.WriteTo([]byte("two"), &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 2000}); err != nil {
+		t.Fatal(err)
+	}
+
+	first := <-observed
+	if first.frame.status != statusNew || first.frame.globalID != globalID || first.frame.target.Host != "first.example" || first.frame.target.DstPort != 1000 || first.payload != "one" {
+		t.Fatalf("first XUDP frame = %+v payload %q", first.frame, first.payload)
+	}
+	second := <-observed
+	if second.frame.status != statusKeep || second.frame.target.DstIP.String() != "1.2.3.4" || second.frame.target.DstPort != 2000 || second.payload != "two" {
+		t.Fatalf("second XUDP frame = %+v payload %q", second.frame, second.payload)
+	}
+
+	buffer := make([]byte, 64)
+	n, addr, err := packetConn.ReadFrom(buffer)
+	if err != nil || string(buffer[:n]) != "alpha" || addr.String() != "reply.example:5300" {
+		t.Fatalf("first response = %q from %v, err=%v", buffer[:n], addr, err)
+	}
+	n, addr, err = packetConn.ReadFrom(buffer)
+	if err != nil || string(buffer[:n]) != "beta" || addr.String() != "8.8.4.4:5353" {
+		t.Fatalf("second response = %q from %v, err=%v", buffer[:n], addr, err)
+	}
+	if _, _, err = packetConn.ReadFrom(buffer); !errors.Is(err, io.EOF) {
+		t.Fatalf("terminal read error = %v, want EOF", err)
+	}
+	if err = <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPacketSessionRejectsOversizedDatagram(t *testing.T) {
+	pool := NewPool(Options{}, echoDialer(new(int), new(sync.Mutex)), func(context.Context) string { return "xudp-large:443" })
+	defer pool.Close()
+	packetConn, err := pool.ListenPacketContext(context.Background(), &C.Metadata{NetWork: C.UDP, Host: "dns.example", DstPort: 53}, [8]byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer packetConn.Close()
+	_, err = packetConn.WriteTo(make([]byte, maxFramePayload+1), domainPacketAddr{host: "dns.example", port: 53})
+	if !errors.Is(err, ErrPacketTooLarge) {
+		t.Fatalf("oversized packet error = %v", err)
+	}
+}
+
+func TestTCPAndXUDPSessionsSharePhysicalCarrier(t *testing.T) {
+	globalPermits = permitRegistry{counts: make(map[string]int)}
+	var mu sync.Mutex
+	dials := 0
+	dial := echoDialer(&dials, &mu)
+	pool := NewPool(Options{Concurrency: 1, XUDPConcurrency: 1, MaxConnections: 1}, dial, func(context.Context) string {
+		return "shared-carrier:443"
+	})
+	defer pool.Close()
+
+	conn, err := pool.DialContext(context.Background(), testTarget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	packetConn, err := pool.ListenPacketContext(context.Background(), &C.Metadata{NetWork: C.UDP, Host: "dns.example", DstPort: 53}, [8]byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer packetConn.Close()
+	mu.Lock()
+	defer mu.Unlock()
+	if dials != 1 {
+		t.Fatalf("TCP and XUDP opened %d physical carriers, want 1", dials)
+	}
+}
+
+func TestXUDPConcurrencyIsIndependentFromTCPConcurrency(t *testing.T) {
+	var mu sync.Mutex
+	dials := 0
+	pool := NewPool(Options{Concurrency: 1, XUDPConcurrency: 2}, echoDialer(&dials, &mu), func(context.Context) string {
+		return "xudp-concurrency:443"
+	})
+	defer pool.Close()
+
+	tcpConn, err := pool.DialContext(context.Background(), testTarget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tcpConn.Close()
+	target := &C.Metadata{NetWork: C.UDP, Host: "dns.example", DstPort: 53}
+	packetOne, err := pool.ListenPacketContext(context.Background(), target, [8]byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer packetOne.Close()
+	packetTwo, err := pool.ListenPacketContext(context.Background(), target, [8]byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer packetTwo.Close()
+	mu.Lock()
+	if dials != 1 {
+		mu.Unlock()
+		t.Fatalf("TCP + two XUDP sessions opened %d carriers, want 1", dials)
+	}
+	mu.Unlock()
+
+	packetThree, err := pool.ListenPacketContext(context.Background(), target, [8]byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer packetThree.Close()
+	mu.Lock()
+	defer mu.Unlock()
+	if dials != 2 {
+		t.Fatalf("third XUDP session opened %d carriers, want 2", dials)
 	}
 }
 

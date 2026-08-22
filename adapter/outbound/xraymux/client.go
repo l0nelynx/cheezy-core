@@ -8,11 +8,14 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/common/contextutils"
+	"github.com/metacubex/mihomo/common/net/deadline"
 	"github.com/metacubex/mihomo/common/pool"
 	C "github.com/metacubex/mihomo/constant"
 
@@ -55,6 +58,7 @@ const (
 var (
 	errMaxConnections = errors.New("xray mux: max connections reached")
 	errDialRateLimit  = errors.New("xray mux: dial rate limit")
+	ErrPacketTooLarge = fmt.Errorf("xray mux: packet exceeds %d bytes", maxFramePayload)
 )
 
 // ProtocolError identifies malformed mux.cool frames and remote session
@@ -79,9 +83,10 @@ type endpointKeyer func(context.Context) string
 
 // Options configures a Mux.Cool client pool.
 type Options struct {
-	Concurrency    int // soft streams/worker; 0 -> 8
-	MaxConnections int // physical carriers; 0 -> unlimited (pack-first)
-	MaxWorkerUses  int // retire worker after N sessions; 0 -> 128
+	Concurrency     int // soft streams/worker; 0 -> 8
+	XUDPConcurrency int // soft packet sessions/worker; 0 -> 16
+	MaxConnections  int // physical carriers; 0 -> unlimited (pack-first)
+	MaxWorkerUses   int // retire worker after N sessions; 0 -> 128
 	// MaxDialsPerMinute caps new physical dials in a sliding 60s window
 	// (handshake budget for censors). 0 -> unlimited.
 	MaxDialsPerMinute int
@@ -97,6 +102,8 @@ type Pool struct {
 	workers             []*worker
 	concurrency         int
 	hardConcurrency     int
+	xudpConcurrency     int
+	hardXUDPConcurrency int
 	maxConnections      int
 	maxWorkerUses       int
 	maxDialsPerMinute   int
@@ -122,6 +129,14 @@ func NewPool(opts Options, dial physicalDialer, endpointKey endpointKeyer) *Pool
 	if hard < concurrency {
 		hard = concurrency
 	}
+	xudpConcurrency := opts.XUDPConcurrency
+	if xudpConcurrency <= 0 {
+		xudpConcurrency = 16
+	}
+	hardXUDP := xudpConcurrency * hardConcurrencyMult
+	if hardXUDP < xudpConcurrency {
+		hardXUDP = xudpConcurrency
+	}
 	firstPayloadTimeout := opts.FirstPayloadTimeout
 	if firstPayloadTimeout == 0 {
 		firstPayloadTimeout = defaultFirstPayloadTimeout
@@ -131,6 +146,8 @@ func NewPool(opts Options, dial physicalDialer, endpointKey endpointKeyer) *Pool
 	p := &Pool{
 		concurrency:         concurrency,
 		hardConcurrency:     hard,
+		xudpConcurrency:     xudpConcurrency,
+		hardXUDPConcurrency: hardXUDP,
 		maxConnections:      opts.MaxConnections,
 		maxWorkerUses:       maxUses,
 		maxDialsPerMinute:   opts.MaxDialsPerMinute,
@@ -146,7 +163,7 @@ func (p *Pool) DialContext(ctx context.Context, metadata *C.Metadata) (net.Conn,
 	if metadata == nil || metadata.NetWork != C.TCP {
 		return nil, errors.New("xray mux: only TCP targets are supported")
 	}
-	return p.dialSession(ctx, metadata, nil)
+	return p.dialSession(ctx, metadata, nil, false)
 }
 
 // DialUDPContext opens a Mux.Cool UDP sub-connection (XUDP Global ID optional).
@@ -154,10 +171,24 @@ func (p *Pool) DialUDPContext(ctx context.Context, metadata *C.Metadata, globalI
 	if metadata == nil || metadata.NetWork != C.UDP {
 		return nil, errors.New("xray mux: DialUDPContext requires a UDP target")
 	}
-	return p.dialSession(ctx, metadata, &globalID)
+	return p.dialSession(ctx, metadata, &globalID, false)
 }
 
-func (p *Pool) dialSession(ctx context.Context, metadata *C.Metadata, globalID *[8]byte) (net.Conn, error) {
+// ListenPacketContext opens a packet-preserving XUDP session.
+func (p *Pool) ListenPacketContext(ctx context.Context, metadata *C.Metadata, globalID [8]byte) (net.PacketConn, error) {
+	if metadata == nil || metadata.NetWork != C.UDP {
+		return nil, errors.New("xray mux: ListenPacketContext requires a UDP target")
+	}
+	return p.dialSession(ctx, metadata, &globalID, true)
+}
+
+func (p *Pool) dialSession(ctx context.Context, metadata *C.Metadata, globalID *[8]byte, packet bool) (*session, error) {
+	softConcurrency := p.concurrency
+	hardConcurrency := p.hardConcurrency
+	if packet {
+		softConcurrency = p.xudpConcurrency
+		hardConcurrency = p.hardXUDPConcurrency
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -170,7 +201,7 @@ func (p *Pool) dialSession(ctx context.Context, metadata *C.Metadata, globalID *
 		if p.wantGrow() {
 			w, err := p.dialWorkerNew(ctx)
 			if err == nil {
-				s := w.reserve(p.concurrency)
+				s := w.reserve(softConcurrency, packet)
 				if s != nil {
 					if err := w.openSession(s, metadata, globalID, p.firstPayloadTimeout); err != nil {
 						return nil, err
@@ -184,7 +215,7 @@ func (p *Pool) dialSession(ctx context.Context, metadata *C.Metadata, globalID *
 		}
 
 		// 2) Soft-allocate onto the least-loaded existing worker.
-		if s := p.tryReserve(p.concurrency); s != nil {
+		if s := p.tryReserve(softConcurrency, packet); s != nil {
 			if err := s.worker.openSession(s, metadata, globalID, p.firstPayloadTimeout); err != nil {
 				return nil, err
 			}
@@ -192,9 +223,9 @@ func (p *Pool) dialSession(ctx context.Context, metadata *C.Metadata, globalID *
 		}
 
 		// 3) Soft full: dial a new carrier (pack-first path when max-connections=0).
-		w, err := p.dialWorker(ctx)
+		w, err := p.dialWorker(ctx, softConcurrency, packet)
 		if err == nil {
-			s := w.reserve(p.concurrency)
+			s := w.reserve(softConcurrency, packet)
 			if s == nil {
 				continue
 			}
@@ -208,7 +239,7 @@ func (p *Pool) dialSession(ctx context.Context, metadata *C.Metadata, globalID *
 		}
 
 		// 4) At physical / rate limit: pack up to hard concurrency (least-loaded).
-		if s := p.tryReserve(p.hardConcurrency); s != nil {
+		if s := p.tryReserve(hardConcurrency, packet); s != nil {
 			if err := s.worker.openSession(s, metadata, globalID, p.firstPayloadTimeout); err != nil {
 				return nil, err
 			}
@@ -216,7 +247,7 @@ func (p *Pool) dialSession(ctx context.Context, metadata *C.Metadata, globalID *
 		}
 
 		// 5) Everything full: wait for a free stream slot (context-cancellable).
-		if err := p.waitForSlot(ctx); err != nil {
+		if err := p.waitForSlot(ctx, hardConcurrency, packet); err != nil {
 			return nil, err
 		}
 	}
@@ -235,7 +266,7 @@ func (p *Pool) wantGrow() bool {
 	return len(p.workers) < p.maxConnections
 }
 
-func (p *Pool) tryReserve(limit int) *session {
+func (p *Pool) tryReserve(limit int, packet bool) *session {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
@@ -247,7 +278,7 @@ func (p *Pool) tryReserve(limit int) *session {
 	bestN := int(^uint(0) >> 1)
 	for _, w := range p.workers {
 		w.mu.Lock()
-		n := len(w.sessions)
+		n := w.activeSessionsLocked(packet)
 		can := !w.closed && n < limit && int(w.total) < w.maxUses
 		w.mu.Unlock()
 		if can && n < bestN {
@@ -258,7 +289,7 @@ func (p *Pool) tryReserve(limit int) *session {
 	if best == nil {
 		return nil
 	}
-	return best.reserve(limit)
+	return best.reserve(limit, packet)
 }
 
 func (p *Pool) pruneLocked() {
@@ -277,9 +308,9 @@ func (p *Pool) dialAllowedLocked(now time.Time) bool {
 	}
 	cutoff := now.Add(-time.Minute)
 	kept := p.dialTimes[:0]
-	for _, t := range p.dialTimes {
-		if t.After(cutoff) {
-			kept = append(kept, t)
+	for _, dialTime := range p.dialTimes {
+		if dialTime.After(cutoff) {
+			kept = append(kept, dialTime)
 		}
 	}
 	p.dialTimes = kept
@@ -287,10 +318,9 @@ func (p *Pool) dialAllowedLocked(now time.Time) bool {
 }
 
 func (p *Pool) recordDialLocked(now time.Time) {
-	if p.maxDialsPerMinute <= 0 {
-		return
+	if p.maxDialsPerMinute > 0 {
+		p.dialTimes = append(p.dialTimes, now)
 	}
-	p.dialTimes = append(p.dialTimes, now)
 }
 
 // dialWorkerNew always opens a new physical carrier (soft-grow path).
@@ -336,7 +366,6 @@ func (p *Pool) dialWorkerNew(ctx context.Context) (*worker, error) {
 		if permitKey != "" {
 			globalPermits.release(permitKey)
 		}
-		// Roll back rate-limit token on failed dial.
 		p.mu.Lock()
 		if n := len(p.dialTimes); n > 0 {
 			p.dialTimes = p.dialTimes[:n-1]
@@ -365,7 +394,7 @@ func (p *Pool) dialWorkerNew(ctx context.Context) (*worker, error) {
 	return w, nil
 }
 
-func (p *Pool) dialWorker(ctx context.Context) (*worker, error) {
+func (p *Pool) dialWorker(ctx context.Context, limit int, packet bool) (*worker, error) {
 	key := "_"
 	if p.endpointKey != nil {
 		if k := p.endpointKey(ctx); k != "" {
@@ -374,7 +403,7 @@ func (p *Pool) dialWorker(ctx context.Context) (*worker, error) {
 	}
 
 	v, err, _ := p.dialGroup.Do(key, func() (any, error) {
-		// Serialize with grow-path dials so rate limit stays accurate.
+		// Serialize with grow-path dials so the rate limit stays accurate.
 		p.dialMu.Lock()
 		defer p.dialMu.Unlock()
 
@@ -385,7 +414,7 @@ func (p *Pool) dialWorker(ctx context.Context) (*worker, error) {
 		}
 		p.pruneLocked()
 		for _, w := range p.workers {
-			if !w.isClosed() && w.hasCapacity(p.concurrency) {
+			if !w.isClosed() && w.hasCapacity(limit, packet) {
 				p.mu.Unlock()
 				return w, nil
 			}
@@ -444,7 +473,7 @@ func (p *Pool) dialWorker(ctx context.Context) (*worker, error) {
 	return v.(*worker), nil
 }
 
-func (p *Pool) waitForSlot(ctx context.Context) error {
+func (p *Pool) waitForSlot(ctx context.Context, limit int, packet bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -461,7 +490,7 @@ func (p *Pool) waitForSlot(ctx context.Context) error {
 		}
 		p.pruneLocked()
 		for _, w := range p.workers {
-			if w.hasCapacity(p.hardConcurrency) {
+			if w.hasCapacity(limit, packet) {
 				return nil
 			}
 		}
@@ -550,17 +579,27 @@ func newWorker(conn net.Conn, maxUses int, release func()) *worker {
 	return w
 }
 
-func (w *worker) hasCapacity(limit int) bool {
+func (w *worker) hasCapacity(limit int, packet bool) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return !w.closed && len(w.sessions) < limit && int(w.total) < w.maxUses
+	return !w.closed && w.activeSessionsLocked(packet) < limit && int(w.total) < w.maxUses
+}
+
+func (w *worker) activeSessionsLocked(packet bool) int {
+	active := 0
+	for _, session := range w.sessions {
+		if session.packet == packet {
+			active++
+		}
+	}
+	return active
 }
 
 // reserve creates a session slot under w.mu without doing any network I/O.
-func (w *worker) reserve(limit int) *session {
+func (w *worker) reserve(limit int, packet bool) *session {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.closed || len(w.sessions) >= limit || int(w.total) >= w.maxUses {
+	if w.closed || w.activeSessionsLocked(packet) >= limit || int(w.total) >= w.maxUses {
 		return nil
 	}
 	if w.idleTimer != nil {
@@ -571,8 +610,15 @@ func (w *worker) reserve(limit int) *session {
 	s := &session{
 		id:     w.total,
 		worker: w,
-		pipe:   newSessionPipe(sessionPipeLimit),
 		done:   make(chan struct{}),
+		packet: packet,
+	}
+	if packet {
+		s.packets = make(chan packetMessage, 16)
+		s.packetReadDeadline = deadline.MakePipeDeadline()
+		s.packetWriteDeadline = deadline.MakePipeDeadline()
+	} else {
+		s.pipe = newSessionPipe(sessionPipeLimit)
 	}
 	w.sessions[s.id] = s
 	return s
@@ -601,7 +647,9 @@ func (w *worker) abandonSession(s *session, cause error) {
 	s.once.Do(func() {
 		s.setTerminalCause(cause)
 		s.stopFirstPayloadTimer()
-		s.pipe.close(cause)
+		if s.pipe != nil {
+			s.pipe.close(cause)
+		}
 		close(s.done)
 	})
 	if w.onFree != nil {
@@ -711,13 +759,13 @@ func (w *worker) carrierFill() {
 func (w *worker) readLoop() {
 	r := bufio.NewReaderSize(&pipeReader{p: w.downlink}, workerReadBuffer)
 	for {
-		id, status, option, err := readMetadata(r)
+		frame, err := readFrameMetadata(r)
 		if err != nil {
 			w.close(err)
 			return
 		}
 		var payload []byte
-		if option&optionData != 0 {
+		if frame.option&optionData != 0 {
 			var size [2]byte
 			if _, err = io.ReadFull(r, size[:]); err != nil {
 				w.close(err)
@@ -732,30 +780,20 @@ func (w *worker) readLoop() {
 			}
 		}
 		w.mu.Lock()
-		s := w.sessions[id]
+		s := w.sessions[frame.id]
 		w.mu.Unlock()
-		switch status {
+		switch frame.status {
 		case statusKeep, statusNew:
 			if s == nil {
 				if payload != nil {
 					_ = pool.Put(payload)
 				}
-				_ = w.writeFrame(id, statusEnd, 0, nil, nil, nil)
+				_ = w.writeFrame(frame.id, statusEnd, 0, nil, nil, nil)
 				continue
 			}
-			if payload != nil {
-				if len(payload) == 0 {
-					_ = pool.Put(payload)
-				} else {
-					// Block when the per-session pipe is full (TCP backpressure).
-					// CarrierFill keeps draining TLS into downlink meanwhile.
-					if err := s.push(payload); err != nil {
-						_ = pool.Put(payload)
-					}
-				}
-			}
-			if option&optionError != 0 {
-				s.finishWithCause(false, false, protocolError("remote session", errors.New("remote reported an error")))
+			if err := s.deliverFrame(frame, payload); err != nil && !errors.Is(err, net.ErrClosed) {
+				w.close(err)
+				return
 			}
 		case statusEnd:
 			if s == nil {
@@ -764,18 +802,10 @@ func (w *worker) readLoop() {
 				}
 				continue
 			}
-			if payload != nil {
-				if len(payload) == 0 {
-					_ = pool.Put(payload)
-				} else if err := s.push(payload); err != nil {
-					_ = pool.Put(payload)
-				}
+			if err := s.deliverFrame(frame, payload); err != nil && !errors.Is(err, net.ErrClosed) {
+				w.close(err)
+				return
 			}
-			var cause error
-			if option&optionError != 0 {
-				cause = protocolError("remote session", errors.New("remote reported an error"))
-			}
-			s.finishWithCause(false, false, cause)
 		case statusKeepAlive:
 			if payload != nil {
 				_ = pool.Put(payload)
@@ -784,7 +814,7 @@ func (w *worker) readLoop() {
 			if payload != nil {
 				_ = pool.Put(payload)
 			}
-			w.close(protocolError("decode metadata", fmt.Errorf("invalid status %d", status)))
+			w.close(protocolError("decode metadata", fmt.Errorf("invalid status %d", frame.status)))
 			return
 		}
 	}
@@ -922,28 +952,70 @@ func (p *sessionPipe) drop(cause error) {
 }
 
 type session struct {
-	id                uint16
-	worker            *worker
-	target            *C.Metadata
-	globalID          [8]byte
-	hasGlobalID       bool
-	pipe              *sessionPipe
-	done              chan struct{}
-	once              sync.Once
-	readMu            sync.Mutex
-	newMu             sync.Mutex
-	newSent           bool
-	newClosed         bool
-	firstPayloadTimer *time.Timer
-	causeMu           sync.Mutex
-	cause             error
-	deadlineMu        sync.Mutex
-	readDeadline      time.Time
-	writeDeadline     time.Time
+	id                  uint16
+	worker              *worker
+	target              *C.Metadata
+	globalID            [8]byte
+	hasGlobalID         bool
+	pipe                *sessionPipe
+	done                chan struct{}
+	packet              bool
+	packets             chan packetMessage
+	packetWriteMu       sync.Mutex
+	packetReadDeadline  deadline.PipeDeadline
+	packetWriteDeadline deadline.PipeDeadline
+	once                sync.Once
+	readMu              sync.Mutex
+	newMu               sync.Mutex
+	newSent             bool
+	newClosed           bool
+	firstPayloadTimer   *time.Timer
+	causeMu             sync.Mutex
+	cause               error
+	deadlineMu          sync.Mutex
+	readDeadline        time.Time
+	writeDeadline       time.Time
+}
+
+type packetMessage struct {
+	payload []byte
+	addr    net.Addr
 }
 
 func (s *session) push(payload []byte) error {
 	return s.pipe.write(payload)
+}
+
+// deliverFrame consumes payload ownership before returning.
+func (s *session) deliverFrame(frame frameMetadata, payload []byte) error {
+	if payload != nil {
+		if len(payload) == 0 {
+			_ = pool.Put(payload)
+		} else if s.packet {
+			target := frame.target
+			if target == nil {
+				target = s.target
+			}
+			if err := s.pushPacket(payload, target); err != nil {
+				return err
+			}
+		} else {
+			// Block when the per-session pipe is full (TCP backpressure).
+			// CarrierFill keeps draining TLS into downlink meanwhile.
+			if err := s.push(payload); err != nil {
+				_ = pool.Put(payload)
+				return err
+			}
+		}
+	}
+	if frame.status == statusEnd || frame.option&optionError != 0 {
+		var cause error
+		if frame.option&optionError != 0 {
+			cause = protocolError("remote session", errors.New("remote reported an error"))
+		}
+		s.finishWithCause(false, false, cause)
+	}
+	return nil
 }
 
 func (s *session) start(firstPayloadTimeout time.Duration) error {
@@ -968,6 +1040,10 @@ func (s *session) start(firstPayloadTimeout time.Duration) error {
 // writeNew sends exactly one New frame. The returned bool reports whether the
 // payload was consumed by that frame rather than needing a Keep frame.
 func (s *session) writeNew(payload []byte) (bool, error) {
+	return s.writeNewTo(payload, s.target)
+}
+
+func (s *session) writeNewTo(payload []byte, target *C.Metadata) (bool, error) {
 	s.newMu.Lock()
 	defer s.newMu.Unlock()
 	if s.newClosed {
@@ -994,7 +1070,7 @@ func (s *session) writeNew(payload []byte) (bool, error) {
 	if s.hasGlobalID {
 		globalID = &s.globalID
 	}
-	if err := s.worker.writeFrame(s.id, statusNew, option, s.target, globalID, payload); err != nil {
+	if err := s.worker.writeFrame(s.id, statusNew, option, target, globalID, payload); err != nil {
 		return true, err
 	}
 	return true, nil
@@ -1025,7 +1101,9 @@ func (s *session) finishWithCause(sendEnd, withError bool, cause error) {
 			_ = s.worker.writeFrame(s.id, statusEnd, opt, nil, nil, nil)
 		}
 		s.setTerminalCause(cause)
-		s.pipe.close(cause)
+		if s.pipe != nil {
+			s.pipe.close(cause)
+		}
 		close(s.done)
 		s.worker.removeSession(s.id)
 	})
@@ -1050,7 +1128,163 @@ func (s *session) closedWriteError() error {
 	return net.ErrClosed
 }
 
+func (s *session) pushPacket(payload []byte, target *C.Metadata) error {
+	if len(payload) == 0 {
+		if payload != nil {
+			_ = pool.Put(payload)
+		}
+		return nil
+	}
+	addr, err := metadataPacketAddr(target)
+	if err != nil {
+		_ = pool.Put(payload)
+		return err
+	}
+	select {
+	case s.packets <- packetMessage{payload: payload, addr: addr}:
+		return nil
+	case <-s.done:
+		_ = pool.Put(payload)
+		return net.ErrClosed
+	}
+}
+
+func (s *session) ReadFrom(p []byte) (int, net.Addr, error) {
+	if !s.packet {
+		return 0, nil, errors.New("xray mux: ReadFrom requires a packet session")
+	}
+	readMessage := func(message packetMessage) (int, net.Addr, error) {
+		n := copy(p, message.payload)
+		_ = pool.Put(message.payload)
+		return n, message.addr, nil
+	}
+	select {
+	case message := <-s.packets:
+		return readMessage(message)
+	default:
+	}
+	select {
+	case message := <-s.packets:
+		return readMessage(message)
+	case <-s.done:
+		select {
+		case message := <-s.packets:
+			return readMessage(message)
+		default:
+		}
+		if cause := s.terminalCause(); cause != nil {
+			return 0, nil, cause
+		}
+		return 0, nil, io.EOF
+	case <-s.packetReadDeadline.Wait():
+		return 0, nil, os.ErrDeadlineExceeded
+	}
+}
+
+func (s *session) WriteTo(payload []byte, addr net.Addr) (int, error) {
+	if !s.packet {
+		return 0, errors.New("xray mux: WriteTo requires a packet session")
+	}
+	if len(payload) == 0 {
+		return 0, nil
+	}
+	if len(payload) > maxFramePayload {
+		return 0, ErrPacketTooLarge
+	}
+	target, err := packetAddrMetadata(addr, s.target)
+	if err != nil {
+		return 0, err
+	}
+
+	s.packetWriteMu.Lock()
+	defer s.packetWriteMu.Unlock()
+	select {
+	case <-s.done:
+		return 0, s.closedWriteError()
+	default:
+	}
+	select {
+	case <-s.packetWriteDeadline.Wait():
+		return 0, os.ErrDeadlineExceeded
+	default:
+	}
+	consumed, err := s.writeNewTo(payload, target)
+	if err == nil && !consumed {
+		err = s.worker.writeFrame(s.id, statusKeep, optionData, target, nil, payload)
+	}
+	if err != nil {
+		s.worker.close(err)
+		return 0, err
+	}
+	return len(payload), nil
+}
+
+func metadataPacketAddr(metadata *C.Metadata) (net.Addr, error) {
+	if metadata == nil || metadata.NetWork != C.UDP {
+		return nil, errors.New("xray mux: UDP frame is missing a target")
+	}
+	if metadata.Host != "" {
+		return domainPacketAddr{host: metadata.Host, port: metadata.DstPort}, nil
+	}
+	if metadata.DstIP.IsValid() {
+		return net.UDPAddrFromAddrPort(netip.AddrPortFrom(metadata.DstIP.Unmap(), metadata.DstPort)), nil
+	}
+	return nil, errors.New("xray mux: UDP target address is empty")
+}
+
+func packetAddrMetadata(addr net.Addr, fallback *C.Metadata) (*C.Metadata, error) {
+	if addr == nil {
+		if fallback == nil {
+			return nil, errors.New("xray mux: nil packet address")
+		}
+		copyTarget := *fallback
+		return &copyTarget, nil
+	}
+	if udpAddr, ok := addr.(*net.UDPAddr); ok {
+		if udpAddr.IP == nil || udpAddr.Port < 0 || udpAddr.Port > int(^uint16(0)) || udpAddr.Zone != "" {
+			return nil, fmt.Errorf("xray mux: invalid UDP address %v", addr)
+		}
+		ip, valid := netip.AddrFromSlice(udpAddr.IP)
+		if !valid {
+			return nil, fmt.Errorf("xray mux: invalid UDP address %v", addr)
+		}
+		return &C.Metadata{NetWork: C.UDP, DstIP: ip.Unmap(), DstPort: uint16(udpAddr.Port)}, nil
+	}
+	host, rawPort, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return nil, fmt.Errorf("xray mux: parse packet address %q: %w", addr.String(), err)
+	}
+	port, err := strconv.ParseUint(rawPort, 10, 16)
+	if err != nil || host == "" {
+		return nil, fmt.Errorf("xray mux: invalid packet address %q", addr.String())
+	}
+	metadata := &C.Metadata{NetWork: C.UDP, DstPort: uint16(port)}
+	if ip, parseErr := netip.ParseAddr(host); parseErr == nil {
+		if ip.Zone() != "" {
+			return nil, errors.New("xray mux: scoped IPv6 packet addresses are not supported")
+		}
+		metadata.DstIP = ip.Unmap()
+	} else {
+		metadata.Host = host
+	}
+	return metadata, nil
+}
+
+type domainPacketAddr struct {
+	host string
+	port uint16
+}
+
+func (a domainPacketAddr) Network() string { return "udp" }
+func (a domainPacketAddr) String() string {
+	return net.JoinHostPort(a.host, strconv.Itoa(int(a.port)))
+}
+
 func (s *session) Read(p []byte) (int, error) {
+	if s.packet {
+		n, _, err := s.ReadFrom(p)
+		return n, err
+	}
 	if len(p) == 0 {
 		return 0, nil
 	}
@@ -1073,6 +1307,13 @@ func (s *session) Read(p []byte) (int, error) {
 }
 
 func (s *session) Write(p []byte) (int, error) {
+	if s.packet {
+		addr, err := metadataPacketAddr(s.target)
+		if err != nil {
+			return 0, err
+		}
+		return s.WriteTo(p, addr)
+	}
 	select {
 	case <-s.done:
 		return 0, s.closedWriteError()
@@ -1118,6 +1359,11 @@ func (s *session) LocalAddr() net.Addr  { return muxAddr("xray-mux-local") }
 func (s *session) RemoteAddr() net.Addr { return muxAddr("xray-mux-remote") }
 
 func (s *session) SetDeadline(t time.Time) error {
+	if s.packet {
+		s.packetReadDeadline.Set(t)
+		s.packetWriteDeadline.Set(t)
+		return nil
+	}
 	s.deadlineMu.Lock()
 	s.readDeadline, s.writeDeadline = t, t
 	s.deadlineMu.Unlock()
@@ -1125,6 +1371,10 @@ func (s *session) SetDeadline(t time.Time) error {
 }
 
 func (s *session) SetReadDeadline(t time.Time) error {
+	if s.packet {
+		s.packetReadDeadline.Set(t)
+		return nil
+	}
 	s.deadlineMu.Lock()
 	s.readDeadline = t
 	s.deadlineMu.Unlock()
@@ -1132,6 +1382,10 @@ func (s *session) SetReadDeadline(t time.Time) error {
 }
 
 func (s *session) SetWriteDeadline(t time.Time) error {
+	if s.packet {
+		s.packetWriteDeadline.Set(t)
+		return nil
+	}
 	s.deadlineMu.Lock()
 	s.writeDeadline = t
 	s.deadlineMu.Unlock()
@@ -1227,7 +1481,20 @@ func appendAddress(dst []byte, metadata *C.Metadata) ([]byte, error) {
 	return nil, errors.New("xray mux: target address is empty")
 }
 
+type frameMetadata struct {
+	id       uint16
+	status   byte
+	option   byte
+	target   *C.Metadata
+	globalID [8]byte
+}
+
 func readMetadata(r io.Reader) (id uint16, status, option byte, err error) {
+	frame, err := readFrameMetadata(r)
+	return frame.id, frame.status, frame.option, err
+}
+
+func readFrameMetadata(r io.Reader) (frame frameMetadata, err error) {
 	var size [2]byte
 	if _, err = io.ReadFull(r, size[:]); err != nil {
 		err = protocolError("read metadata length", err)
@@ -1243,18 +1510,20 @@ func readMetadata(r io.Reader) (id uint16, status, option byte, err error) {
 		err = protocolError("read metadata", err)
 		return
 	}
-	id = binary.BigEndian.Uint16(meta[:2])
-	status = meta[2]
-	option = meta[3]
-	switch status {
+	frame.id = binary.BigEndian.Uint16(meta[:2])
+	frame.status = meta[2]
+	frame.option = meta[3]
+	switch frame.status {
 	case statusNew:
-		if err = validateTargetMetadata(meta[4:], false); err != nil {
+		frame.target, frame.globalID, err = decodeTargetMetadata(meta[4:], false)
+		if err != nil {
 			err = protocolError("decode target", err)
 			return
 		}
 	case statusKeep:
 		if len(meta) > 4 {
-			if err = validateTargetMetadata(meta[4:], true); err != nil {
+			frame.target, frame.globalID, err = decodeTargetMetadata(meta[4:], true)
+			if err != nil {
 				err = protocolError("decode target", err)
 				return
 			}
@@ -1265,51 +1534,72 @@ func readMetadata(r io.Reader) (id uint16, status, option byte, err error) {
 			return
 		}
 	default:
-		err = protocolError("decode metadata", fmt.Errorf("invalid status %d", status))
+		err = protocolError("decode metadata", fmt.Errorf("invalid status %d", frame.status))
 		return
 	}
-	if option & ^byte(optionData|optionError) != 0 {
-		err = protocolError("decode metadata", fmt.Errorf("invalid option %d", option))
+	if frame.option & ^byte(optionData|optionError) != 0 {
+		err = protocolError("decode metadata", fmt.Errorf("invalid option %d", frame.option))
 	}
 	return
 }
 
-func validateTargetMetadata(raw []byte, keep bool) error {
+func decodeTargetMetadata(raw []byte, keep bool) (*C.Metadata, [8]byte, error) {
+	var globalID [8]byte
 	if len(raw) < 4 {
-		return io.ErrUnexpectedEOF
+		return nil, globalID, io.ErrUnexpectedEOF
 	}
 	network := raw[0]
 	if network != targetTCP && network != targetUDP {
-		return fmt.Errorf("invalid network %d", network)
+		return nil, globalID, fmt.Errorf("invalid network %d", network)
 	}
 	if keep && network != targetUDP {
-		return errors.New("follow-up target is only valid for UDP")
+		return nil, globalID, errors.New("follow-up target is only valid for UDP")
+	}
+	metadata := &C.Metadata{DstPort: binary.BigEndian.Uint16(raw[1:3])}
+	if network == targetTCP {
+		metadata.NetWork = C.TCP
+	} else {
+		metadata.NetWork = C.UDP
 	}
 	address := raw[3:]
 	consumed := 0
 	switch address[0] {
 	case 0x01:
 		consumed = 1 + net.IPv4len
+		if len(address) >= consumed {
+			var rawIP [net.IPv4len]byte
+			copy(rawIP[:], address[1:consumed])
+			metadata.DstIP = netip.AddrFrom4(rawIP)
+		}
 	case 0x02:
 		if len(address) < 2 || address[1] == 0 {
-			return io.ErrUnexpectedEOF
+			return nil, globalID, io.ErrUnexpectedEOF
 		}
 		consumed = 2 + int(address[1])
+		if len(address) >= consumed {
+			metadata.Host = string(address[2:consumed])
+		}
 	case 0x03:
 		consumed = 1 + net.IPv6len
+		if len(address) >= consumed {
+			var rawIP [net.IPv6len]byte
+			copy(rawIP[:], address[1:consumed])
+			metadata.DstIP = netip.AddrFrom16(rawIP)
+		}
 	default:
-		return fmt.Errorf("invalid address type %d", address[0])
+		return nil, globalID, fmt.Errorf("invalid address type %d", address[0])
 	}
 	if len(address) < consumed {
-		return io.ErrUnexpectedEOF
+		return nil, globalID, io.ErrUnexpectedEOF
 	}
 	trailing := len(address) - consumed
 	if !keep && network == targetUDP {
 		if trailing != 8 {
-			return fmt.Errorf("invalid GlobalID length %d", trailing)
+			return nil, globalID, fmt.Errorf("invalid GlobalID length %d", trailing)
 		}
+		copy(globalID[:], address[consumed:])
 	} else if trailing != 0 {
-		return fmt.Errorf("unexpected trailing metadata: %d bytes", trailing)
+		return nil, globalID, fmt.Errorf("unexpected trailing metadata: %d bytes", trailing)
 	}
-	return nil
+	return metadata, globalID, nil
 }

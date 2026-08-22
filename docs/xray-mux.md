@@ -13,9 +13,13 @@ xray-mux:
   max-connections: 3          # soft-grow target + hard cap (0 = pack-first, unlimited)
   max-dials-per-minute: 3     # handshake budget; 0 = unlimited
   max-worker-uses: 128        # 0 → 128
+  xudp-concurrency: 16        # soft XUDP sessions/carrier; 0 → 16
+  xudp-proxy-udp443: reject   # reject | allow | skip
 ```
 
 Только raw TCP VLESS; `flow` / ws / grpc / xhttp → mux тихо выключается.
+
+TCP и XUDP используют одни физические carrier’ы с независимыми soft concurrency, поэтому делят реальный `max-connections` и один `max-dials-per-minute` без starvation между пулами. XUDP сохраняет границы UDP datagram и destination каждого пакета. Для UDP/443 политика по умолчанию `reject`; `allow` пропускает через XUDP, `skip` использует обычный VLESS UDP/XUDP без Mux.Cool.
 
 ## Политика пула (xmux-inspired)
 

@@ -37,6 +37,15 @@ import (
 	"github.com/samber/lo"
 )
 
+const (
+	defaultXrayMuxXUDPConcurrency = 16
+	xrayMuxUDP443Reject           = "reject"
+	xrayMuxUDP443Allow            = "allow"
+	xrayMuxUDP443Skip             = "skip"
+)
+
+var ErrXrayMuxUDP443Rejected = errors.New("xray mux: rejected UDP/443 traffic")
+
 type Vless struct {
 	*Base
 	client *vless.Client
@@ -94,11 +103,13 @@ type VlessOption struct {
 }
 
 type XrayMuxOption struct {
-	Enabled           bool `proxy:"enabled,omitempty"`
-	Concurrency       int  `proxy:"concurrency,omitempty"`
-	MaxConnections    int  `proxy:"max-connections,omitempty"`
-	MaxWorkerUses     int  `proxy:"max-worker-uses,omitempty"`
-	MaxDialsPerMinute int  `proxy:"max-dials-per-minute,omitempty"` // handshake budget; 0=unlimited
+	Enabled           bool   `proxy:"enabled,omitempty"`
+	Concurrency       int    `proxy:"concurrency,omitempty"`
+	MaxConnections    int    `proxy:"max-connections,omitempty"`
+	MaxWorkerUses     int    `proxy:"max-worker-uses,omitempty"`
+	MaxDialsPerMinute int    `proxy:"max-dials-per-minute,omitempty"` // handshake budget; 0=unlimited
+	XUDPConcurrency   int    `proxy:"xudp-concurrency,omitempty"`
+	XUDPProxyUDP443   string `proxy:"xudp-proxy-udp443,omitempty"`
 }
 
 type XHTTPOptions struct {
@@ -400,18 +411,22 @@ func (v *Vless) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 		return nil, err
 	}
 
-	// Multiplex UDP as Mux.Cool UDP sub-connections (with XUDP Global ID) when enabled.
-	// Do NOT wrap with NewXUDPConn — that also speaks Mux.Cool and would double-frame.
-	if v.xrayMux != nil {
+	// Multiplex UDP as packet-preserving Mux.Cool/XUDP sessions. Do not wrap
+	// with NewXUDPConn: the pool already owns Mux.Cool framing.
+	useXrayMux, err := v.useXrayMuxForUDP(metadata.DstPort)
+	if err != nil {
+		return nil, err
+	}
+	if useXrayMux {
 		var globalID [8]byte
 		if metadata.SourceValid() {
 			globalID = utils.GlobalID(metadata.SourceAddress())
 		}
-		c, muxErr := v.xrayMux.DialUDPContext(ctx, metadata, globalID)
+		packetConn, muxErr := v.xrayMux.ListenPacketContext(ctx, metadata, globalID)
 		if muxErr != nil {
 			return nil, muxErr
 		}
-		return NewPacketConn(N.NewThreadSafePacketConn(newMuxPacketConn(c, metadata.UDPAddr())), v), nil
+		return NewPacketConn(N.NewThreadSafePacketConn(packetConn), v), nil
 	}
 
 	c, err := v.dialContext(ctx)
@@ -446,23 +461,21 @@ func (v *Vless) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 	return NewPacketConn(N.NewThreadSafePacketConn(v.client.PacketConn(c, metadata.UDPAddr())), v), nil
 }
 
-// muxPacketConn adapts a connected Mux.Cool UDP session to PacketConn.
-type muxPacketConn struct {
-	net.Conn
-	addr net.Addr
-}
-
-func newMuxPacketConn(conn net.Conn, addr net.Addr) *muxPacketConn {
-	return &muxPacketConn{Conn: conn, addr: addr}
-}
-
-func (c *muxPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	n, err := c.Conn.Read(p)
-	return n, c.addr, err
-}
-
-func (c *muxPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
-	return c.Conn.Write(p)
+func (v *Vless) useXrayMuxForUDP(port uint16) (bool, error) {
+	if v.xrayMux == nil {
+		return false, nil
+	}
+	if port != 443 {
+		return true, nil
+	}
+	switch v.option.XrayMux.XUDPProxyUDP443 {
+	case xrayMuxUDP443Reject:
+		return false, ErrXrayMuxUDP443Rejected
+	case xrayMuxUDP443Skip:
+		return false, nil
+	default: // allow
+		return true, nil
+	}
 }
 
 // SupportUOT implements C.ProxyAdapter
@@ -543,6 +556,21 @@ func NewVless(option VlessOption) (*Vless, error) {
 	}
 	if option.XrayMux.MaxDialsPerMinute < 0 {
 		return nil, errors.New("xray-mux max-dials-per-minute must not be negative")
+	}
+	if option.XrayMux.XUDPConcurrency < 0 {
+		return nil, errors.New("xray-mux xudp-concurrency must not be negative")
+	}
+	if option.XrayMux.XUDPConcurrency == 0 {
+		option.XrayMux.XUDPConcurrency = defaultXrayMuxXUDPConcurrency
+	}
+	option.XrayMux.XUDPProxyUDP443 = strings.ToLower(strings.TrimSpace(option.XrayMux.XUDPProxyUDP443))
+	if option.XrayMux.XUDPProxyUDP443 == "" {
+		option.XrayMux.XUDPProxyUDP443 = xrayMuxUDP443Reject
+	}
+	switch option.XrayMux.XUDPProxyUDP443 {
+	case xrayMuxUDP443Reject, xrayMuxUDP443Allow, xrayMuxUDP443Skip:
+	default:
+		return nil, errors.New("xray-mux xudp-proxy-udp443 must be reject, allow, or skip")
 	}
 	var addons *vless.Addons
 	if len(option.Flow) >= 16 {
@@ -995,6 +1023,7 @@ func NewVless(option VlessOption) (*Vless, error) {
 	if option.XrayMux.Enabled {
 		v.xrayMux = xraymux.NewPool(xraymux.Options{
 			Concurrency:       option.XrayMux.Concurrency,
+			XUDPConcurrency:   option.XrayMux.XUDPConcurrency,
 			MaxConnections:    option.XrayMux.MaxConnections,
 			MaxWorkerUses:     option.XrayMux.MaxWorkerUses,
 			MaxDialsPerMinute: option.XrayMux.MaxDialsPerMinute,
