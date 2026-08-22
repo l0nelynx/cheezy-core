@@ -64,6 +64,8 @@ XRAY_BIN=/path/to/xray go run ./hack/xraymux-bench \
 - Per-session pipe **512KiB** (как xray `PerConnection`)
 - **Async carrier downlink 256KiB**: отдельная goroutine читает TLS/VLESS → pipe; demux читает из pipe. Как xray `DialingWorkerFactory` (там 64KiB). Без этого backpressure demux сразу останавливал `conn.Read` → на LTE типично ~64KiB/RTT ≈ 2–3 Mbps
 - `session.Read` сливает несколько chunk’ов за вызов (ближе к xray MultiBuffer)
+- Первый TCP payload ждём до **100мс** и объединяем с `New`-кадром; для server-first протоколов по таймауту уходит пустой `New`
+- Payload в финальном `End` сначала отдаётся приложению, затем `Read` возвращает EOF или protocol/carrier error
 - Soft-grow / least-loaded / `max-dials-per-minute` — см. выше
 
 ## Тесты

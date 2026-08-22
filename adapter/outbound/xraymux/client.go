@@ -20,18 +20,18 @@ import (
 )
 
 const (
-	statusNew       byte = 0x01
-	statusKeep      byte = 0x02
-	statusEnd       byte = 0x03
-	statusKeepAlive byte = 0x04
-	optionData      byte = 0x01
-	optionError     byte = 0x02
-	targetTCP       byte = 0x01
-	targetUDP       byte = 0x02
-	maxFramePayload      = 8 * 1024
-	maxMetadataSize      = 512
-	defaultMaxUses       = 128
-	defaultConcurrency   = 8
+	statusNew          byte = 0x01
+	statusKeep         byte = 0x02
+	statusEnd          byte = 0x03
+	statusKeepAlive    byte = 0x04
+	optionData         byte = 0x01
+	optionError        byte = 0x02
+	targetTCP          byte = 0x01
+	targetUDP          byte = 0x02
+	maxFramePayload         = 8 * 1024
+	maxMetadataSize         = 512
+	defaultMaxUses          = 128
+	defaultConcurrency      = 8
 	// Per-session download window. xray-core's 64KiB pipe.WithSizeLimit is the
 	// *worker carrier* cushion between TLS and demux — not the app buffer.
 	// Session output there defaults to policy.Buffer.PerConnection (512KiB on
@@ -46,12 +46,33 @@ const (
 	workerReadBuffer     = 64 * 1024
 	hardConcurrencyMult  = 4
 	workerIdleTime       = 16 * time.Second
+	// Wait briefly for the first application write so it can share the New
+	// frame. This matches Xray's mux behavior while still allowing server-first
+	// protocols to start after the timeout.
+	defaultFirstPayloadTimeout = 100 * time.Millisecond
 )
 
 var (
 	errMaxConnections = errors.New("xray mux: max connections reached")
 	errDialRateLimit  = errors.New("xray mux: dial rate limit")
 )
+
+// ProtocolError identifies malformed mux.cool frames and remote session
+// failures without hiding the underlying cause.
+type ProtocolError struct {
+	Op  string
+	Err error
+}
+
+func (e *ProtocolError) Error() string {
+	return fmt.Sprintf("xray mux %s: %v", e.Op, e.Err)
+}
+
+func (e *ProtocolError) Unwrap() error { return e.Err }
+
+func protocolError(op string, err error) error {
+	return &ProtocolError{Op: op, Err: err}
+}
 
 type physicalDialer func(context.Context) (net.Conn, error)
 type endpointKeyer func(context.Context) string
@@ -64,24 +85,28 @@ type Options struct {
 	// MaxDialsPerMinute caps new physical dials in a sliding 60s window
 	// (handshake budget for censors). 0 -> unlimited.
 	MaxDialsPerMinute int
+	// FirstPayloadTimeout delays a TCP New frame so the first payload can be
+	// coalesced into it. 0 uses 100ms; a negative value disables the delay.
+	FirstPayloadTimeout time.Duration
 }
 
 // Pool multiplexes logical TCP connections over Xray Mux.Cool workers.
 type Pool struct {
-	mu                sync.Mutex
-	dialMu            sync.Mutex // serializes physical dials (handshake pacing)
-	workers           []*worker
-	concurrency       int
-	hardConcurrency   int
-	maxConnections    int
-	maxWorkerUses     int
-	maxDialsPerMinute int
-	dial              physicalDialer
-	endpointKey       endpointKeyer
-	closed            bool
-	dialGroup         singleflight.Group
-	free              *sync.Cond
-	dialTimes         []time.Time // sliding window for MaxDialsPerMinute
+	mu                  sync.Mutex
+	dialMu              sync.Mutex // serializes physical dials (handshake pacing)
+	workers             []*worker
+	concurrency         int
+	hardConcurrency     int
+	maxConnections      int
+	maxWorkerUses       int
+	maxDialsPerMinute   int
+	firstPayloadTimeout time.Duration
+	dial                physicalDialer
+	endpointKey         endpointKeyer
+	closed              bool
+	dialGroup           singleflight.Group
+	free                *sync.Cond
+	dialTimes           []time.Time // sliding window for MaxDialsPerMinute
 }
 
 func NewPool(opts Options, dial physicalDialer, endpointKey endpointKeyer) *Pool {
@@ -97,14 +122,21 @@ func NewPool(opts Options, dial physicalDialer, endpointKey endpointKeyer) *Pool
 	if hard < concurrency {
 		hard = concurrency
 	}
+	firstPayloadTimeout := opts.FirstPayloadTimeout
+	if firstPayloadTimeout == 0 {
+		firstPayloadTimeout = defaultFirstPayloadTimeout
+	} else if firstPayloadTimeout < 0 {
+		firstPayloadTimeout = 0
+	}
 	p := &Pool{
-		concurrency:       concurrency,
-		hardConcurrency:   hard,
-		maxConnections:    opts.MaxConnections,
-		maxWorkerUses:     maxUses,
-		maxDialsPerMinute: opts.MaxDialsPerMinute,
-		dial:              dial,
-		endpointKey:       endpointKey,
+		concurrency:         concurrency,
+		hardConcurrency:     hard,
+		maxConnections:      opts.MaxConnections,
+		maxWorkerUses:       maxUses,
+		maxDialsPerMinute:   opts.MaxDialsPerMinute,
+		firstPayloadTimeout: firstPayloadTimeout,
+		dial:                dial,
+		endpointKey:         endpointKey,
 	}
 	p.free = sync.NewCond(&p.mu)
 	return p
@@ -140,7 +172,7 @@ func (p *Pool) dialSession(ctx context.Context, metadata *C.Metadata, globalID *
 			if err == nil {
 				s := w.reserve(p.concurrency)
 				if s != nil {
-					if err := w.openSession(s, metadata, globalID); err != nil {
+					if err := w.openSession(s, metadata, globalID, p.firstPayloadTimeout); err != nil {
 						return nil, err
 					}
 					return s, nil
@@ -153,7 +185,7 @@ func (p *Pool) dialSession(ctx context.Context, metadata *C.Metadata, globalID *
 
 		// 2) Soft-allocate onto the least-loaded existing worker.
 		if s := p.tryReserve(p.concurrency); s != nil {
-			if err := s.worker.openSession(s, metadata, globalID); err != nil {
+			if err := s.worker.openSession(s, metadata, globalID, p.firstPayloadTimeout); err != nil {
 				return nil, err
 			}
 			return s, nil
@@ -166,7 +198,7 @@ func (p *Pool) dialSession(ctx context.Context, metadata *C.Metadata, globalID *
 			if s == nil {
 				continue
 			}
-			if err := w.openSession(s, metadata, globalID); err != nil {
+			if err := w.openSession(s, metadata, globalID, p.firstPayloadTimeout); err != nil {
 				return nil, err
 			}
 			return s, nil
@@ -177,7 +209,7 @@ func (p *Pool) dialSession(ctx context.Context, metadata *C.Metadata, globalID *
 
 		// 4) At physical / rate limit: pack up to hard concurrency (least-loaded).
 		if s := p.tryReserve(p.hardConcurrency); s != nil {
-			if err := s.worker.openSession(s, metadata, globalID); err != nil {
+			if err := s.worker.openSession(s, metadata, globalID, p.firstPayloadTimeout); err != nil {
 				return nil, err
 			}
 			return s, nil
@@ -325,7 +357,7 @@ func (p *Pool) dialWorkerNew(ctx context.Context) (*worker, error) {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
-		w.close()
+		w.close(net.ErrClosed)
 		return nil, net.ErrClosed
 	}
 	p.workers = append(p.workers, w)
@@ -399,7 +431,7 @@ func (p *Pool) dialWorker(ctx context.Context) (*worker, error) {
 		p.mu.Lock()
 		if p.closed {
 			p.mu.Unlock()
-			w.close()
+			w.close(net.ErrClosed)
 			return nil, net.ErrClosed
 		}
 		p.workers = append(p.workers, w)
@@ -458,7 +490,7 @@ func (p *Pool) Close() error {
 	p.free.Broadcast()
 	p.mu.Unlock()
 	for _, w := range workers {
-		w.close()
+		w.close(net.ErrClosed)
 	}
 	return nil
 }
@@ -546,23 +578,30 @@ func (w *worker) reserve(limit int) *session {
 	return s
 }
 
-// openSession sends the Mux.Cool New frame outside any worker/pool lock.
-func (w *worker) openSession(s *session, metadata *C.Metadata, globalID *[8]byte) error {
+// openSession arms the Mux.Cool New frame outside any worker/pool lock. TCP
+// waits briefly for the first payload; UDP always starts with its first packet.
+func (w *worker) openSession(s *session, metadata *C.Metadata, globalID *[8]byte, firstPayloadTimeout time.Duration) error {
 	s.target = metadata
-	if err := w.writeFrame(s.id, statusNew, 0, metadata, globalID, nil); err != nil {
-		w.abandonSession(s)
-		go w.close()
+	if globalID != nil {
+		s.globalID = *globalID
+		s.hasGlobalID = true
+	}
+	if err := s.start(firstPayloadTimeout); err != nil {
+		w.abandonSession(s, err)
+		go w.close(err)
 		return err
 	}
 	return nil
 }
 
-func (w *worker) abandonSession(s *session) {
+func (w *worker) abandonSession(s *session, cause error) {
 	w.mu.Lock()
 	delete(w.sessions, s.id)
 	w.mu.Unlock()
 	s.once.Do(func() {
-		s.pipe.close()
+		s.setTerminalCause(cause)
+		s.stopFirstPayloadTimer()
+		s.pipe.close(cause)
 		close(s.done)
 	})
 	if w.onFree != nil {
@@ -575,14 +614,14 @@ func (w *worker) removeSession(id uint16) {
 	delete(w.sessions, id)
 	shouldClose := int(w.total) >= w.maxUses && len(w.sessions) == 0
 	if !shouldClose && len(w.sessions) == 0 && !w.closed {
-		w.idleTimer = time.AfterFunc(workerIdleTime, w.close)
+		w.idleTimer = time.AfterFunc(workerIdleTime, func() { w.close(net.ErrClosed) })
 	}
 	w.mu.Unlock()
 	if w.onFree != nil {
 		w.onFree()
 	}
 	if shouldClose {
-		w.close()
+		w.close(net.ErrClosed)
 	}
 }
 
@@ -592,8 +631,11 @@ func (w *worker) isClosed() bool {
 	return w.closed
 }
 
-func (w *worker) close() {
+func (w *worker) close(cause error) {
 	w.closeOnce.Do(func() {
+		if cause == nil {
+			cause = net.ErrClosed
+		}
 		w.mu.Lock()
 		w.closed = true
 		if w.idleTimer != nil {
@@ -607,11 +649,10 @@ func (w *worker) close() {
 		w.mu.Unlock()
 		_ = w.conn.Close()
 		if w.downlink != nil {
-			w.downlink.drop()
+			w.downlink.drop(cause)
 		}
 		for _, s := range sessions {
-			s.pipe.drop()
-			s.finish(false, false)
+			s.finishWithCause(false, false, cause)
 		}
 		if w.release != nil {
 			w.release()
@@ -620,6 +661,12 @@ func (w *worker) close() {
 }
 
 func (w *worker) writeFrame(id uint16, status, option byte, target *C.Metadata, globalID *[8]byte, payload []byte) error {
+	if len(payload) > maxFramePayload {
+		return protocolError("encode", fmt.Errorf("payload length %d exceeds %d", len(payload), maxFramePayload))
+	}
+	if len(payload) > 0 && option&optionData == 0 {
+		return protocolError("encode", errors.New("payload provided without data option"))
+	}
 	meta, err := encodeMetadata(id, status, option, target, globalID)
 	if err != nil {
 		return err
@@ -640,8 +687,8 @@ func (w *worker) writeFrame(id uint16, status, option byte, target *C.Metadata, 
 // carrierFill continuously drains the physical TLS/VLESS conn into downlink so
 // demux backpressure does not immediately stop socket Reads (xray DialingWorkerFactory).
 func (w *worker) carrierFill() {
-	defer w.downlink.close()
 	buf := make([]byte, 32*1024)
+	var cause error
 	for {
 		n, err := w.conn.Read(buf)
 		if n > 0 {
@@ -649,33 +696,38 @@ func (w *worker) carrierFill() {
 			copy(chunk, buf[:n])
 			if werr := w.downlink.write(chunk); werr != nil {
 				_ = pool.Put(chunk)
+				cause = werr
 				break
 			}
 		}
 		if err != nil {
+			cause = err
 			break
 		}
 	}
+	w.downlink.close(cause)
 }
 
 func (w *worker) readLoop() {
-	defer w.close()
 	r := bufio.NewReaderSize(&pipeReader{p: w.downlink}, workerReadBuffer)
 	for {
 		id, status, option, err := readMetadata(r)
 		if err != nil {
+			w.close(err)
 			return
 		}
 		var payload []byte
 		if option&optionData != 0 {
 			var size [2]byte
 			if _, err = io.ReadFull(r, size[:]); err != nil {
+				w.close(err)
 				return
 			}
 			n := int(binary.BigEndian.Uint16(size[:]))
 			payload = pool.Get(n)
 			if _, err = io.ReadFull(r, payload); err != nil {
 				_ = pool.Put(payload)
+				w.close(err)
 				return
 			}
 		}
@@ -683,7 +735,7 @@ func (w *worker) readLoop() {
 		s := w.sessions[id]
 		w.mu.Unlock()
 		switch status {
-		case statusKeep:
+		case statusKeep, statusNew:
 			if s == nil {
 				if payload != nil {
 					_ = pool.Put(payload)
@@ -691,21 +743,40 @@ func (w *worker) readLoop() {
 				_ = w.writeFrame(id, statusEnd, 0, nil, nil, nil)
 				continue
 			}
-			if len(payload) > 0 {
-				// Block when the per-session pipe is full (TCP backpressure).
-				// CarrierFill keeps draining TLS into downlink meanwhile.
-				if err := s.push(payload); err != nil {
+			if payload != nil {
+				if len(payload) == 0 {
+					_ = pool.Put(payload)
+				} else {
+					// Block when the per-session pipe is full (TCP backpressure).
+					// CarrierFill keeps draining TLS into downlink meanwhile.
+					if err := s.push(payload); err != nil {
+						_ = pool.Put(payload)
+					}
+				}
+			}
+			if option&optionError != 0 {
+				s.finishWithCause(false, false, protocolError("remote session", errors.New("remote reported an error")))
+			}
+		case statusEnd:
+			if s == nil {
+				if payload != nil {
+					_ = pool.Put(payload)
+				}
+				continue
+			}
+			if payload != nil {
+				if len(payload) == 0 {
+					_ = pool.Put(payload)
+				} else if err := s.push(payload); err != nil {
 					_ = pool.Put(payload)
 				}
 			}
-		case statusEnd:
-			if payload != nil {
-				_ = pool.Put(payload)
+			var cause error
+			if option&optionError != 0 {
+				cause = protocolError("remote session", errors.New("remote reported an error"))
 			}
-			if s != nil {
-				s.finish(false, option&optionError != 0)
-			}
-		case statusKeepAlive, statusNew:
+			s.finishWithCause(false, false, cause)
+		case statusKeepAlive:
 			if payload != nil {
 				_ = pool.Put(payload)
 			}
@@ -713,6 +784,7 @@ func (w *worker) readLoop() {
 			if payload != nil {
 				_ = pool.Put(payload)
 			}
+			w.close(protocolError("decode metadata", fmt.Errorf("invalid status %d", status)))
 			return
 		}
 	}
@@ -734,6 +806,7 @@ type sessionPipe struct {
 	nbytes int
 	limit  int
 	closed bool
+	err    error
 }
 
 func newSessionPipe(limit int) *sessionPipe {
@@ -785,6 +858,9 @@ func (p *sessionPipe) readDeadline(dst []byte, deadline time.Time) (int, error) 
 		p.cond.Wait()
 	}
 	if len(p.chunks) == 0 {
+		if p.err != nil {
+			return 0, p.err
+		}
 		return 0, io.EOF
 	}
 	return p.readLocked(dst), nil
@@ -817,13 +893,14 @@ func (p *sessionPipe) readLocked(dst []byte) int {
 	return n
 }
 
-func (p *sessionPipe) close() {
+func (p *sessionPipe) close(cause error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
 		return
 	}
 	p.closed = true
+	p.err = cause
 	// Keep buffered chunks so Read can drain in-flight download data after End.
 	// Discarding here truncated speedtest downloads when End arrived before the
 	// consumer emptied the pipe.
@@ -831,10 +908,11 @@ func (p *sessionPipe) close() {
 }
 
 // drop releases any remaining pooled chunks. Only for hard worker teardown.
-func (p *sessionPipe) drop() {
+func (p *sessionPipe) drop(cause error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.closed = true
+	p.err = cause
 	for _, c := range p.chunks {
 		_ = pool.Put(c)
 	}
@@ -844,24 +922,101 @@ func (p *sessionPipe) drop() {
 }
 
 type session struct {
-	id            uint16
-	worker        *worker
-	target        *C.Metadata
-	pipe          *sessionPipe
-	done          chan struct{}
-	once          sync.Once
-	readMu        sync.Mutex
-	deadlineMu    sync.Mutex
-	readDeadline  time.Time
-	writeDeadline time.Time
+	id                uint16
+	worker            *worker
+	target            *C.Metadata
+	globalID          [8]byte
+	hasGlobalID       bool
+	pipe              *sessionPipe
+	done              chan struct{}
+	once              sync.Once
+	readMu            sync.Mutex
+	newMu             sync.Mutex
+	newSent           bool
+	newClosed         bool
+	firstPayloadTimer *time.Timer
+	causeMu           sync.Mutex
+	cause             error
+	deadlineMu        sync.Mutex
+	readDeadline      time.Time
+	writeDeadline     time.Time
 }
 
 func (s *session) push(payload []byte) error {
 	return s.pipe.write(payload)
 }
 
+func (s *session) start(firstPayloadTimeout time.Duration) error {
+	if s.target != nil && s.target.NetWork == C.UDP {
+		// An initial UDP frame must carry the first datagram and GlobalID.
+		return nil
+	}
+	if firstPayloadTimeout <= 0 {
+		_, err := s.writeNew(nil)
+		return err
+	}
+	s.newMu.Lock()
+	s.firstPayloadTimer = time.AfterFunc(firstPayloadTimeout, func() {
+		if _, err := s.writeNew(nil); err != nil {
+			s.worker.close(err)
+		}
+	})
+	s.newMu.Unlock()
+	return nil
+}
+
+// writeNew sends exactly one New frame. The returned bool reports whether the
+// payload was consumed by that frame rather than needing a Keep frame.
+func (s *session) writeNew(payload []byte) (bool, error) {
+	s.newMu.Lock()
+	defer s.newMu.Unlock()
+	if s.newClosed {
+		return false, s.closedWriteError()
+	}
+	if s.newSent {
+		return false, nil
+	}
+	select {
+	case <-s.done:
+		return false, s.closedWriteError()
+	default:
+	}
+	if s.firstPayloadTimer != nil {
+		s.firstPayloadTimer.Stop()
+		s.firstPayloadTimer = nil
+	}
+	s.newSent = true
+	option := byte(0)
+	if len(payload) > 0 {
+		option = optionData
+	}
+	var globalID *[8]byte
+	if s.hasGlobalID {
+		globalID = &s.globalID
+	}
+	if err := s.worker.writeFrame(s.id, statusNew, option, s.target, globalID, payload); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func (s *session) stopFirstPayloadTimer() {
+	s.newMu.Lock()
+	s.newClosed = true
+	if s.firstPayloadTimer != nil {
+		s.firstPayloadTimer.Stop()
+		s.firstPayloadTimer = nil
+	}
+	s.newMu.Unlock()
+}
+
 func (s *session) finish(sendEnd, withError bool) {
+	s.finishWithCause(sendEnd, withError, nil)
+}
+
+func (s *session) finishWithCause(sendEnd, withError bool, cause error) {
 	s.once.Do(func() {
+		s.stopFirstPayloadTimer()
 		if sendEnd && !s.worker.isClosed() {
 			opt := byte(0)
 			if withError {
@@ -869,10 +1024,30 @@ func (s *session) finish(sendEnd, withError bool) {
 			}
 			_ = s.worker.writeFrame(s.id, statusEnd, opt, nil, nil, nil)
 		}
-		s.pipe.close()
+		s.setTerminalCause(cause)
+		s.pipe.close(cause)
 		close(s.done)
 		s.worker.removeSession(s.id)
 	})
+}
+
+func (s *session) setTerminalCause(cause error) {
+	s.causeMu.Lock()
+	s.cause = cause
+	s.causeMu.Unlock()
+}
+
+func (s *session) terminalCause() error {
+	s.causeMu.Lock()
+	defer s.causeMu.Unlock()
+	return s.cause
+}
+
+func (s *session) closedWriteError() error {
+	if cause := s.terminalCause(); cause != nil {
+		return cause
+	}
+	return net.ErrClosed
 }
 
 func (s *session) Read(p []byte) (int, error) {
@@ -900,7 +1075,7 @@ func (s *session) Read(p []byte) (int, error) {
 func (s *session) Write(p []byte) (int, error) {
 	select {
 	case <-s.done:
-		return 0, net.ErrClosed
+		return 0, s.closedWriteError()
 	default:
 	}
 	deadline := s.getWriteDeadline()
@@ -913,13 +1088,23 @@ func (s *session) Write(p []byte) (int, error) {
 		if n > maxFramePayload {
 			n = maxFramePayload
 		}
+		consumed, err := s.writeNew(p[:n])
+		if err != nil {
+			s.worker.close(err)
+			return written, err
+		}
+		if consumed {
+			written += n
+			p = p[n:]
+			continue
+		}
 		// UDP Keep frames must repeat the destination address (Mux.Cool).
 		var keepTarget *C.Metadata
 		if s.target != nil && s.target.NetWork == C.UDP {
 			keepTarget = s.target
 		}
 		if err := s.worker.writeFrame(s.id, statusKeep, optionData, keepTarget, nil, p[:n]); err != nil {
-			s.worker.close()
+			s.worker.close(err)
 			return written, err
 		}
 		written += n
@@ -971,6 +1156,17 @@ func (a muxAddr) Network() string { return "xray-mux" }
 func (a muxAddr) String() string  { return string(a) }
 
 func encodeMetadata(id uint16, status, option byte, target *C.Metadata, globalID *[8]byte) ([]byte, error) {
+	switch status {
+	case statusNew, statusKeep, statusEnd, statusKeepAlive:
+	default:
+		return nil, protocolError("encode metadata", fmt.Errorf("invalid status %d", status))
+	}
+	if option & ^byte(optionData|optionError) != 0 {
+		return nil, protocolError("encode metadata", fmt.Errorf("invalid option %d", option))
+	}
+	if globalID != nil && *globalID != [8]byte{} && (status != statusNew || target == nil || target.NetWork != C.UDP || option&optionData == 0) {
+		return nil, protocolError("encode metadata", errors.New("GlobalID is only valid on an initial UDP data frame"))
+	}
 	body := make([]byte, 4, 64)
 	binary.BigEndian.PutUint16(body[:2], id)
 	body[2] = status
@@ -1034,19 +1230,86 @@ func appendAddress(dst []byte, metadata *C.Metadata) ([]byte, error) {
 func readMetadata(r io.Reader) (id uint16, status, option byte, err error) {
 	var size [2]byte
 	if _, err = io.ReadFull(r, size[:]); err != nil {
+		err = protocolError("read metadata length", err)
 		return
 	}
 	n := int(binary.BigEndian.Uint16(size[:]))
 	if n < 4 || n > maxMetadataSize {
-		err = fmt.Errorf("xray mux: invalid metadata length %d", n)
+		err = protocolError("read metadata", fmt.Errorf("invalid metadata length %d", n))
 		return
 	}
 	meta := make([]byte, n)
 	if _, err = io.ReadFull(r, meta); err != nil {
+		err = protocolError("read metadata", err)
 		return
 	}
 	id = binary.BigEndian.Uint16(meta[:2])
 	status = meta[2]
 	option = meta[3]
+	switch status {
+	case statusNew:
+		if err = validateTargetMetadata(meta[4:], false); err != nil {
+			err = protocolError("decode target", err)
+			return
+		}
+	case statusKeep:
+		if len(meta) > 4 {
+			if err = validateTargetMetadata(meta[4:], true); err != nil {
+				err = protocolError("decode target", err)
+				return
+			}
+		}
+	case statusEnd, statusKeepAlive:
+		if len(meta) != 4 {
+			err = protocolError("decode metadata", fmt.Errorf("unexpected trailing metadata: %d bytes", len(meta)-4))
+			return
+		}
+	default:
+		err = protocolError("decode metadata", fmt.Errorf("invalid status %d", status))
+		return
+	}
+	if option & ^byte(optionData|optionError) != 0 {
+		err = protocolError("decode metadata", fmt.Errorf("invalid option %d", option))
+	}
 	return
+}
+
+func validateTargetMetadata(raw []byte, keep bool) error {
+	if len(raw) < 4 {
+		return io.ErrUnexpectedEOF
+	}
+	network := raw[0]
+	if network != targetTCP && network != targetUDP {
+		return fmt.Errorf("invalid network %d", network)
+	}
+	if keep && network != targetUDP {
+		return errors.New("follow-up target is only valid for UDP")
+	}
+	address := raw[3:]
+	consumed := 0
+	switch address[0] {
+	case 0x01:
+		consumed = 1 + net.IPv4len
+	case 0x02:
+		if len(address) < 2 || address[1] == 0 {
+			return io.ErrUnexpectedEOF
+		}
+		consumed = 2 + int(address[1])
+	case 0x03:
+		consumed = 1 + net.IPv6len
+	default:
+		return fmt.Errorf("invalid address type %d", address[0])
+	}
+	if len(address) < consumed {
+		return io.ErrUnexpectedEOF
+	}
+	trailing := len(address) - consumed
+	if !keep && network == targetUDP {
+		if trailing != 8 {
+			return fmt.Errorf("invalid GlobalID length %d", trailing)
+		}
+	} else if trailing != 0 {
+		return fmt.Errorf("unexpected trailing metadata: %d bytes", trailing)
+	}
+	return nil
 }
