@@ -18,3 +18,8 @@ then opens a pull request for manual review. It never merges upstream code into
 CheezyClash must depend on a promoted commit SHA through a Go module `replace`.
 It must not depend directly on a moving branch.
 
+## Cheezy extensions
+
+- [WAP upstream support](docs/wap-upstream.md) documents the bounded HTTP
+  `CONNECT` outbound, destination-port allowlist, diagnostics, Android
+  integration contract, and normal-mode compatibility.
