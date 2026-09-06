@@ -3,23 +3,25 @@ package provider
 import (
 	"encoding"
 	"fmt"
+	"strings"
 
 	"github.com/dlclark/regexp2"
 )
 
 type overrideSchema struct {
-	TFO            *bool   `provider:"tfo,omitempty"`
-	MPTcp          *bool   `provider:"mptcp,omitempty"`
-	UDP            *bool   `provider:"udp,omitempty"`
-	UDPOverTCP     *bool   `provider:"udp-over-tcp,omitempty"`
-	Up             *string `provider:"up,omitempty"`
-	Down           *string `provider:"down,omitempty"`
-	DialerProxy    *string `provider:"dialer-proxy,omitempty"`
-	SkipCertVerify *bool   `provider:"skip-cert-verify,omitempty"`
-	NameCertVerify *string `provider:"name-cert-verify,omitempty"`
-	Interface      *string `provider:"interface-name,omitempty"`
-	RoutingMark    *int    `provider:"routing-mark,omitempty"`
-	IPVersion      *string `provider:"ip-version,omitempty"`
+	TFO            *bool          `provider:"tfo,omitempty"`
+	MPTcp          *bool          `provider:"mptcp,omitempty"`
+	UDP            *bool          `provider:"udp,omitempty"`
+	UDPOverTCP     *bool          `provider:"udp-over-tcp,omitempty"`
+	Up             *string        `provider:"up,omitempty"`
+	Down           *string        `provider:"down,omitempty"`
+	DialerProxy    *string        `provider:"dialer-proxy,omitempty"`
+	SkipCertVerify *bool          `provider:"skip-cert-verify,omitempty"`
+	NameCertVerify *string        `provider:"name-cert-verify,omitempty"`
+	Interface      *string        `provider:"interface-name,omitempty"`
+	RoutingMark    *int           `provider:"routing-mark,omitempty"`
+	IPVersion      *string        `provider:"ip-version,omitempty"`
+	XrayMux        map[string]any `provider:"xray-mux,omitempty"`
 
 	AdditionalPrefix *string                   `provider:"additional-prefix,omitempty"`
 	AdditionalSuffix *string                   `provider:"additional-suffix,omitempty"`
@@ -73,7 +75,6 @@ func (o *overrideSchema) Apply(mapping map[string]any) error {
 	if o.IPVersion != nil {
 		mapping["ip-version"] = *o.IPVersion
 	}
-
 	for _, expr := range o.ProxyName {
 		name := mapping["name"].(string)
 		newName, err := expr.Pattern.Replace(name, expr.Target, 0, -1)
@@ -93,6 +94,29 @@ func (o *overrideSchema) Apply(mapping map[string]any) error {
 			return fmt.Errorf("override-expr[%d] %q: %w", idx, expr.String(), err)
 		}
 	}
+	if o.XrayMux != nil && isRawTCPVless(mapping) {
+		xrayMux := make(map[string]any, len(o.XrayMux))
+		for key, value := range o.XrayMux {
+			xrayMux[key] = value
+		}
+		mapping["xray-mux"] = xrayMux
+	} else if o.XrayMux != nil {
+		delete(mapping, "xray-mux")
+	}
 
 	return nil
+}
+
+func isRawTCPVless(mapping map[string]any) bool {
+	proxyType, _ := mapping["type"].(string)
+	if !strings.EqualFold(strings.TrimSpace(proxyType), "vless") {
+		return false
+	}
+	flow, _ := mapping["flow"].(string)
+	if strings.TrimSpace(flow) != "" {
+		return false
+	}
+	network, _ := mapping["network"].(string)
+	network = strings.TrimSpace(network)
+	return network == "" || strings.EqualFold(network, "tcp")
 }

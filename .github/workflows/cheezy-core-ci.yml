@@ -1,0 +1,27 @@
+name: Cheezy Core CI
+
+on:
+  push:
+    branches: [cheezy-wap]
+  pull_request:
+    branches: [cheezy-wap]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify module identity
+        run: test "$(sed -n '1p' go.mod)" = "module github.com/metacubex/mihomo"
+      - name: Test
+        run: go test ./...
+

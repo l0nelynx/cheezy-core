@@ -10,11 +10,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/metacubex/mihomo/adapter/outbound/xraymux"
 	"github.com/metacubex/mihomo/common/convert"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/ech"
+	"github.com/metacubex/mihomo/component/resolver"
 	tlsC "github.com/metacubex/mihomo/component/tls"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/gun"
@@ -36,6 +38,15 @@ import (
 	"github.com/samber/lo"
 )
 
+const (
+	defaultXrayMuxXUDPConcurrency = 16
+	xrayMuxUDP443Reject           = "reject"
+	xrayMuxUDP443Allow            = "allow"
+	xrayMuxUDP443Skip             = "skip"
+)
+
+var ErrXrayMuxUDP443Rejected = errors.New("xray mux: rejected UDP/443 traffic")
+
 type Vless struct {
 	*Base
 	client *vless.Client
@@ -53,6 +64,7 @@ type Vless struct {
 	restlsConfig    *restls.Config
 	jlsConfig       *jls.Config
 	realityConfig   *tlsC.RealityConfig
+	xrayMux         *xraymux.Pool
 }
 
 type VlessOption struct {
@@ -88,6 +100,17 @@ type VlessOption struct {
 	PrivateKey        string            `proxy:"private-key,omitempty"`
 	ServerName        string            `proxy:"servername,omitempty"`
 	ClientFingerprint string            `proxy:"client-fingerprint,omitempty"`
+	XrayMux           XrayMuxOption     `proxy:"xray-mux,omitempty"`
+}
+
+type XrayMuxOption struct {
+	Enabled           bool   `proxy:"enabled,omitempty"`
+	Concurrency       int    `proxy:"concurrency,omitempty"`
+	MaxConnections    int    `proxy:"max-connections,omitempty"`
+	MaxWorkerUses     int    `proxy:"max-worker-uses,omitempty"`
+	MaxDialsPerMinute int    `proxy:"max-dials-per-minute,omitempty"` // handshake budget; 0=unlimited
+	XUDPConcurrency   int    `proxy:"xudp-concurrency,omitempty"`
+	XUDPProxyUDP443   string `proxy:"xudp-proxy-udp443,omitempty"`
 }
 
 type XHTTPOptions struct {
@@ -153,6 +176,10 @@ type XHTTPDownloadSettings struct {
 }
 
 func (v *Vless) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.Metadata) (_ net.Conn, err error) {
+	return v.streamConnWithTransport(ctx, c, metadata, false)
+}
+
+func (v *Vless) streamConnWithTransport(ctx context.Context, c net.Conn, metadata *C.Metadata, mux bool) (_ net.Conn, err error) {
 	switch v.option.Network {
 	case "ws":
 		host, port, _ := net.SplitHostPort(v.addr)
@@ -265,10 +292,10 @@ func (v *Vless) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 		return nil, err
 	}
 
-	return v.streamConnContext(ctx, c, metadata)
+	return v.streamConnContext(ctx, c, metadata, mux)
 }
 
-func (v *Vless) streamConnContext(ctx context.Context, c net.Conn, metadata *C.Metadata) (conn net.Conn, err error) {
+func (v *Vless) streamConnContext(ctx context.Context, c net.Conn, metadata *C.Metadata, mux bool) (conn net.Conn, err error) {
 	if ctx.Done() != nil {
 		done := N.SetupContextForConn(ctx, c)
 		defer done(&err)
@@ -278,6 +305,13 @@ func (v *Vless) streamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 		if err != nil {
 			return
 		}
+	}
+	if mux {
+		conn, err = v.client.StreamConn(c, &vless.DstAddr{Mux: true})
+		if err != nil {
+			conn = nil
+		}
+		return
 	}
 	if metadata.NetWork == C.UDP {
 		if v.option.PacketAddr {
@@ -350,6 +384,13 @@ func (v *Vless) dialContext(ctx context.Context) (c net.Conn, err error) {
 
 // DialContext implements C.ProxyAdapter
 func (v *Vless) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
+	if v.xrayMux != nil && metadata.NetWork == C.TCP {
+		c, muxErr := v.xrayMux.DialContext(ctx, metadata)
+		if muxErr != nil {
+			return nil, muxErr
+		}
+		return NewConn(c, v), nil
+	}
 	c, err := v.dialContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("%s connect error: %s", v.addr, err.Error())
@@ -369,6 +410,24 @@ func (v *Vless) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn
 func (v *Vless) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_ C.PacketConn, err error) {
 	if err = v.ResolveUDP(ctx, metadata); err != nil {
 		return nil, err
+	}
+
+	// Multiplex UDP as packet-preserving Mux.Cool/XUDP sessions. Do not wrap
+	// with NewXUDPConn: the pool already owns Mux.Cool framing.
+	useXrayMux, err := v.useXrayMuxForUDP(metadata.DstPort)
+	if err != nil {
+		return nil, err
+	}
+	if useXrayMux {
+		var globalID [8]byte
+		if metadata.SourceValid() {
+			globalID = utils.GlobalID(metadata.SourceAddress())
+		}
+		packetConn, muxErr := v.xrayMux.ListenPacketContext(ctx, metadata, globalID)
+		if muxErr != nil {
+			return nil, muxErr
+		}
+		return NewPacketConn(N.NewThreadSafePacketConn(packetConn), v), nil
 	}
 
 	c, err := v.dialContext(ctx)
@@ -403,6 +462,23 @@ func (v *Vless) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 	return NewPacketConn(N.NewThreadSafePacketConn(v.client.PacketConn(c, metadata.UDPAddr())), v), nil
 }
 
+func (v *Vless) useXrayMuxForUDP(port uint16) (bool, error) {
+	if v.xrayMux == nil {
+		return false, nil
+	}
+	if port != 443 {
+		return true, nil
+	}
+	switch v.option.XrayMux.XUDPProxyUDP443 {
+	case xrayMuxUDP443Reject:
+		return false, ErrXrayMuxUDP443Rejected
+	case xrayMuxUDP443Skip:
+		return false, nil
+	default: // allow
+		return true, nil
+	}
+}
+
 // SupportUOT implements C.ProxyAdapter
 func (v *Vless) SupportUOT() bool {
 	return true
@@ -425,6 +501,11 @@ func (v *Vless) Close() error {
 	}
 	if v.xhttpClient != nil {
 		if err := v.xhttpClient.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if v.xrayMux != nil {
+		if err := v.xrayMux.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -460,6 +541,38 @@ func parseVlessAddr(metadata *C.Metadata, xudp bool) *vless.DstAddr {
 }
 
 func NewVless(option VlessOption) (*Vless, error) {
+	option.Flow = strings.TrimSpace(option.Flow)
+	network := strings.TrimSpace(option.Network)
+	if option.Flow != "" || (network != "" && !strings.EqualFold(network, "tcp")) {
+		option.XrayMux = XrayMuxOption{}
+	}
+	if option.XrayMux.Concurrency < 0 {
+		return nil, errors.New("xray-mux concurrency must not be negative")
+	}
+	if option.XrayMux.MaxConnections < 0 {
+		return nil, errors.New("xray-mux max-connections must not be negative")
+	}
+	if option.XrayMux.MaxWorkerUses < 0 {
+		return nil, errors.New("xray-mux max-worker-uses must not be negative")
+	}
+	if option.XrayMux.MaxDialsPerMinute < 0 {
+		return nil, errors.New("xray-mux max-dials-per-minute must not be negative")
+	}
+	if option.XrayMux.XUDPConcurrency < 0 {
+		return nil, errors.New("xray-mux xudp-concurrency must not be negative")
+	}
+	if option.XrayMux.XUDPConcurrency == 0 {
+		option.XrayMux.XUDPConcurrency = defaultXrayMuxXUDPConcurrency
+	}
+	option.XrayMux.XUDPProxyUDP443 = strings.ToLower(strings.TrimSpace(option.XrayMux.XUDPProxyUDP443))
+	if option.XrayMux.XUDPProxyUDP443 == "" {
+		option.XrayMux.XUDPProxyUDP443 = xrayMuxUDP443Reject
+	}
+	switch option.XrayMux.XUDPProxyUDP443 {
+	case xrayMuxUDP443Reject, xrayMuxUDP443Allow, xrayMuxUDP443Skip:
+	default:
+		return nil, errors.New("xray-mux xudp-proxy-udp443 must be reject, allow, or skip")
+	}
 	var addons *vless.Addons
 	if len(option.Flow) >= 16 {
 		option.Flow = option.Flow[:16]
@@ -914,5 +1027,39 @@ func NewVless(option VlessOption) (*Vless, error) {
 		}
 	}
 
+	if option.XrayMux.Enabled {
+		v.xrayMux = xraymux.NewPool(xraymux.Options{
+			Concurrency:       option.XrayMux.Concurrency,
+			XUDPConcurrency:   option.XrayMux.XUDPConcurrency,
+			MaxConnections:    option.XrayMux.MaxConnections,
+			MaxWorkerUses:     option.XrayMux.MaxWorkerUses,
+			MaxDialsPerMinute: option.XrayMux.MaxDialsPerMinute,
+		}, v.dialXrayMux, v.xrayMuxEndpointKey)
+	}
+
 	return v, nil
+}
+
+func (v *Vless) dialXrayMux(ctx context.Context) (conn net.Conn, err error) {
+	conn, err = v.dialContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("%s connect error: %w", v.addr, err)
+	}
+	defer func(c net.Conn) { safeConnClose(c, err) }(conn)
+	conn, err = v.streamConnWithTransport(ctx, conn, &C.Metadata{NetWork: C.TCP}, true)
+	if err != nil {
+		return nil, fmt.Errorf("%s mux connect error: %w", v.addr, err)
+	}
+	return conn, nil
+}
+
+func (v *Vless) xrayMuxEndpointKey(ctx context.Context) string {
+	host := v.option.Server
+	if ip := net.ParseIP(host); ip != nil {
+		return net.JoinHostPort(ip.String(), strconv.Itoa(v.option.Port))
+	}
+	if ip, err := resolver.ResolveIP(ctx, host); err == nil {
+		return net.JoinHostPort(ip.String(), strconv.Itoa(v.option.Port))
+	}
+	return net.JoinHostPort(strings.ToLower(host), strconv.Itoa(v.option.Port))
 }

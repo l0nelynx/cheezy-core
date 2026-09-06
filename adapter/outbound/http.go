@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"sync"
+	"sync/atomic"
 
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/connectionlimit"
 	C "github.com/metacubex/mihomo/constant"
 
 	"github.com/metacubex/http"
@@ -23,6 +26,9 @@ type Http struct {
 	pass      string
 	tlsConfig *tls.Config
 	option    *HttpOption
+	limiter   *connectionlimit.Limiter
+	ports     map[uint16]struct{}
+	rejected  atomic.Int64
 }
 
 type HttpOption struct {
@@ -40,6 +46,22 @@ type HttpOption struct {
 	Certificate    string            `proxy:"certificate,omitempty"`
 	PrivateKey     string            `proxy:"private-key,omitempty"`
 	Headers        map[string]string `proxy:"headers,omitempty"`
+	MaxConnections int               `proxy:"max-connections,omitempty"`
+	AllowedPorts   []int             `proxy:"allowed-connect-ports,omitempty"`
+}
+
+var httpConnectionLimiters = connectionlimit.NewRegistry()
+
+type limitedConn struct {
+	net.Conn
+	release func()
+	once    sync.Once
+}
+
+func (c *limitedConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.release)
+	return err
 }
 
 // StreamConnContext implements C.ProxyAdapter
@@ -61,6 +83,27 @@ func (h *Http) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.Me
 
 // DialContext implements C.ProxyAdapter
 func (h *Http) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
+	if len(h.ports) != 0 {
+		if _, allowed := h.ports[metadata.DstPort]; !allowed {
+			h.rejected.Add(1)
+			return nil, fmt.Errorf("HTTP CONNECT destination port %d is not allowed", metadata.DstPort)
+		}
+	}
+
+	release := func() {}
+	if h.limiter != nil {
+		release, err = h.limiter.Acquire(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("waiting for HTTP CONNECT slot: %w", err)
+		}
+	}
+	releaseOnError := true
+	defer func() {
+		if releaseOnError {
+			release()
+		}
+	}()
+
 	c, err := h.dialer.DialContext(ctx, "tcp", h.addr)
 	if err != nil {
 		return nil, fmt.Errorf("%s connect error: %w", h.addr, err)
@@ -75,7 +118,17 @@ func (h *Http) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn,
 		return nil, err
 	}
 
-	return NewConn(c, h), nil
+	releaseOnError = false
+	return NewConn(&limitedConn{Conn: c, release: release}, h), nil
+}
+
+// ConnectionLimitStats returns aggregate, non-sensitive limiter diagnostics.
+func (h *Http) ConnectionLimitStats() (active, waiting int64, limit int, rejectedPorts int64) {
+	if h.limiter != nil {
+		snapshot := h.limiter.Snapshot()
+		active, waiting, limit = snapshot.Active, snapshot.Waiting, snapshot.Limit
+	}
+	return active, waiting, limit, h.rejected.Load()
 }
 
 // ProxyInfo implements C.ProxyAdapter
@@ -168,6 +221,18 @@ func NewHttp(option HttpOption) (*Http, error) {
 		}
 	}
 
+	ports := make(map[uint16]struct{}, len(option.AllowedPorts))
+	for _, port := range option.AllowedPorts {
+		if port < 1 || port > 65535 {
+			return nil, fmt.Errorf("invalid allowed CONNECT port: %d", port)
+		}
+		ports[uint16(port)] = struct{}{}
+	}
+	limiter, err := httpConnectionLimiters.Get(net.JoinHostPort(option.Server, strconv.Itoa(option.Port))+"\x00"+option.UserName, option.MaxConnections)
+	if err != nil {
+		return nil, err
+	}
+
 	outbound := &Http{
 		Base: NewBase(BaseOption{
 			Name:         option.Name,
@@ -184,6 +249,8 @@ func NewHttp(option HttpOption) (*Http, error) {
 		pass:      option.Password,
 		tlsConfig: tlsConfig,
 		option:    &option,
+		limiter:   limiter,
+		ports:     ports,
 	}
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
 	return outbound, nil

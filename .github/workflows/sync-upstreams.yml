@@ -1,0 +1,54 @@
+name: Sync upstream Alpha branches
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+    inputs:
+      source:
+        description: Upstream to integrate; the ref is always Alpha
+        required: true
+        type: choice
+        default: vernesong
+        options: [vernesong, metacubex]
+      dry_run:
+        description: Validate without pushing mirror or PR branches
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream-alpha
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require upstream sync token
+        env:
+          UPSTREAM_SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+        run: |
+          if [[ -z "$UPSTREAM_SYNC_TOKEN" ]]; then
+            echo "::error::Add the UPSTREAM_SYNC_TOKEN Actions secret with Contents, Workflows, Pull requests, and Issues write permissions."
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          ref: cheezy-wap
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Validate and prepare upstream sync
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_SOURCE: ${{ inputs.source }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: bash .github/scripts/sync-upstreams.sh
