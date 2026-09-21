@@ -11,16 +11,14 @@ import (
 )
 
 type RealityOptions struct {
-	PublicKey string `proxy:"public-key"`
-	ShortID   string `proxy:"short-id,omitempty"`
-
-	SupportX25519MLKEM768 bool `proxy:"support-x25519mlkem768,omitempty"`
+	PublicKey     string `proxy:"public-key"`
+	ShortID       string `proxy:"short-id,omitempty"`
+	Mldsa65Verify string `proxy:"mldsa65-verify,omitempty"`
 }
 
 func (o RealityOptions) Parse() (*tlsC.RealityConfig, error) {
 	if o.PublicKey != "" {
 		config := new(tlsC.RealityConfig)
-		config.SupportX25519MLKEM768 = o.SupportX25519MLKEM768
 
 		const x25519ScalarSize = 32
 		publicKey, err := base64.RawURLEncoding.DecodeString(o.PublicKey)
@@ -41,7 +39,16 @@ func (o RealityOptions) Parse() (*tlsC.RealityConfig, error) {
 			return nil, errors.New("invalid REALITY short ID")
 		}
 
+		if o.Mldsa65Verify != "" {
+			config.Mldsa65Verify, err = base64.RawURLEncoding.DecodeString(o.Mldsa65Verify)
+			if err != nil || len(config.Mldsa65Verify) != 1952 {
+				return nil, errors.New("invalid REALITY ML-DSA-65 verification key")
+			}
+		}
 		return config, nil
+	}
+	if o.Mldsa65Verify != "" {
+		return nil, errors.New("REALITY ML-DSA-65 verification requires a public key")
 	}
 	return nil, nil
 }

@@ -5,6 +5,7 @@ import "github.com/metacubex/mihomo/listener/reality"
 type RealityConfig struct {
 	Dest              string   `inbound:"dest"`
 	PrivateKey        string   `inbound:"private-key"`
+	Mldsa65Seed       string   `inbound:"mldsa65-seed,omitempty"`
 	ShortID           []string `inbound:"short-id"`
 	ServerNames       []string `inbound:"server-names"`
 	MaxTimeDifference int      `inbound:"max-time-difference,omitempty"`
@@ -24,6 +25,7 @@ func (c RealityConfig) Build() reality.Config {
 	return reality.Config{
 		Dest:              c.Dest,
 		PrivateKey:        c.PrivateKey,
+		Mldsa65Seed:       c.Mldsa65Seed,
 		ShortID:           c.ShortID,
 		ServerNames:       c.ServerNames,
 		MaxTimeDifference: c.MaxTimeDifference,

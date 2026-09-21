@@ -1,6 +1,7 @@
 package inbound_test
 
 import (
+	"encoding/base64"
 	"net"
 	"net/netip"
 	"testing"
@@ -8,6 +9,7 @@ import (
 	"github.com/metacubex/mihomo/adapter/outbound"
 	"github.com/metacubex/mihomo/listener/inbound"
 	"github.com/metacubex/mihomo/transport/vless/encryption"
+	utls "github.com/metacubex/utls"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -366,14 +368,32 @@ func TestInboundVless_Reality(t *testing.T) {
 		ClientFingerprint: "chrome",
 	}
 	testInboundVless(t, inboundOptions, outboundOptions)
+	t.Run("ML-DSA-65", func(t *testing.T) {
+		seed := make([]byte, 32)
+		seed[0] = 1
+		_, verify, err := utls.RealityMldsa65KeyFromSeed(seed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inboundOptions := inboundOptions
+		inboundOptions.RealityConfig.Mldsa65Seed = base64.RawURLEncoding.EncodeToString(seed)
+		outboundOptions := outboundOptions
+		outboundOptions.RealityOpts.Mldsa65Verify = base64.RawURLEncoding.EncodeToString(verify)
+		testInboundVless(t, inboundOptions, outboundOptions)
+		t.Run("xtls-rprx-vision", func(t *testing.T) {
+			outboundOptions := outboundOptions
+			outboundOptions.Flow = "xtls-rprx-vision"
+			testInboundVless(t, inboundOptions, outboundOptions)
+		})
+	})
 	t.Run("xtls-rprx-vision", func(t *testing.T) {
 		outboundOptions := outboundOptions
 		outboundOptions.Flow = "xtls-rprx-vision"
 		testInboundVless(t, inboundOptions, outboundOptions)
 	})
-	t.Run("X25519MLKEM768", func(t *testing.T) {
+	t.Run("Firefox X25519MLKEM768", func(t *testing.T) {
 		outboundOptions := outboundOptions
-		outboundOptions.RealityOpts.SupportX25519MLKEM768 = true
+		outboundOptions.ClientFingerprint = "firefox"
 		testInboundVless(t, inboundOptions, outboundOptions)
 		t.Run("xtls-rprx-vision", func(t *testing.T) {
 			outboundOptions := outboundOptions
@@ -405,9 +425,9 @@ func TestInboundVless_Reality_Grpc(t *testing.T) {
 		GrpcOpts:          outbound.GrpcOptions{GrpcServiceName: "GunService"},
 	}
 	testInboundVless(t, inboundOptions, outboundOptions)
-	t.Run("X25519MLKEM768", func(t *testing.T) {
+	t.Run("Firefox X25519MLKEM768", func(t *testing.T) {
 		outboundOptions := outboundOptions
-		outboundOptions.RealityOpts.SupportX25519MLKEM768 = true
+		outboundOptions.ClientFingerprint = "firefox"
 		testInboundVless(t, inboundOptions, outboundOptions)
 	})
 }

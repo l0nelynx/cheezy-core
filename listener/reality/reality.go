@@ -1,6 +1,7 @@
 package reality
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/hex"
@@ -25,6 +26,7 @@ type LimitFallback = utls.RealityLimitFallback
 type Config struct {
 	Dest              string
 	PrivateKey        string
+	Mldsa65Seed       string
 	ShortID           []string
 	ServerNames       []string
 	MaxTimeDifference int
@@ -53,8 +55,21 @@ func (c Config) Build(tunnel C.Tunnel) (*Builder, error) {
 		return nil, errors.New("invalid private key")
 	}
 	realityConfig.PrivateKey = privateKey
+	if c.Mldsa65Seed != "" {
+		seed, err := base64.RawURLEncoding.DecodeString(c.Mldsa65Seed)
+		if err != nil || len(seed) != 32 {
+			return nil, errors.New("invalid REALITY ML-DSA-65 seed")
+		}
+		if bytes.Equal(seed, privateKey) {
+			return nil, errors.New("REALITY ML-DSA-65 seed and private key must be different")
+		}
+		realityConfig.Mldsa65Key, _, err = utls.RealityMldsa65KeyFromSeed(seed)
+		if err != nil {
+			return nil, fmt.Errorf("derive REALITY ML-DSA-65 key: %w", err)
+		}
+	}
 
-	realityConfig.MaxTimeDiff = time.Duration(c.MaxTimeDifference) * time.Microsecond
+	realityConfig.MaxTimeDiff = time.Duration(c.MaxTimeDifference) * time.Millisecond
 
 	realityConfig.ShortIds = make(map[[8]byte]bool)
 	for i, shortIDString := range c.ShortID {
