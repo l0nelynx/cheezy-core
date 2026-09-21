@@ -967,8 +967,8 @@ proxies: # socks5
     reality-opts:
       public-key: xxx
       short-id: xxx # optional
-      support-x25519mlkem768: false # 如果服务端支持可手动设置为true
-    client-fingerprint: chrome # cannot be empty
+      # mldsa65-verify: <base64url ML-DSA-65 public key> # optional
+    client-fingerprint: chrome # REALITY defaults to chrome; use chrome120 for legacy servers
 
   - name: "vless-reality-grpc"
     type: vless
@@ -994,7 +994,7 @@ proxies: # socks5
     reality-opts:
       public-key: CrrQSjAG_YkHLwvM2M-7XkKJilgL5upBKCp0od0tLhE
       short-id: 10f897e26c4b9478
-      support-x25519mlkem768: false # 如果服务端支持可手动设置为true
+      # mldsa65-verify: <base64url ML-DSA-65 public key> # optional
 
   - name: "vless-ws"
     type: vless
