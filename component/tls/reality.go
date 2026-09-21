@@ -32,13 +32,14 @@ type RealityConfig struct {
 	PublicKey *ecdh.PublicKey
 	ShortID   [RealityMaxShortIDLen]byte
 
-	SupportX25519MLKEM768 bool
+	Mldsa65Verify []byte
 }
 
 func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHelloID, serverName string, realityConfig *RealityConfig) (net.Conn, error) {
 	for retry := 0; ; retry++ {
 		verifier := &realityVerifier{
-			serverName: serverName,
+			serverName:    serverName,
+			mldsa65Verify: realityConfig.Mldsa65Verify,
 		}
 		uConfig := &utls.Config{
 			Time:                   ntp.Now,
@@ -53,13 +54,6 @@ func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHello
 		err := uConn.BuildHandshakeState()
 		if err != nil {
 			return nil, err
-		}
-
-		if !realityConfig.SupportX25519MLKEM768 { // for X25519MLKEM768 does not work properly with the old reality server
-			err = BuildRemovedX25519MLKEM768HandshakeState(uConn)
-			if err != nil {
-				return nil, err
-			}
 		}
 
 		hello := uConn.HandshakeState.Hello
@@ -168,18 +162,41 @@ func realityClientFallback(uConn net.Conn, serverName string, fingerprint utls.C
 
 type realityVerifier struct {
 	*utls.UConn
-	serverName string
-	authKey    []byte
-	verified   bool
+	serverName    string
+	authKey       []byte
+	mldsa65Verify []byte
+	verified      bool
 }
 
 func (c *realityVerifier) VerifyConnection(state utls.ConnectionState) error {
-	log.Debugln("REALITY localAddr: %v is using X25519MLKEM768 for TLS' communication: %v", c.RemoteAddr(), c.HandshakeState.ServerHello.ServerShare.Group == utls.X25519MLKEM768)
+	if c.UConn != nil && c.HandshakeState.ServerHello != nil {
+		log.Debugln("REALITY remoteAddr: %v is using X25519MLKEM768 for TLS' communication: %v", c.RemoteAddr(), c.HandshakeState.ServerHello.ServerShare.Group == utls.X25519MLKEM768)
+	}
 	certs := state.PeerCertificates
+	if len(certs) == 0 {
+		return errors.New("REALITY server sent no certificate")
+	}
 	if pub, ok := certs[0].PublicKey.(ed25519.PublicKey); ok {
 		h := hmac.New(sha512.New, c.authKey)
 		h.Write(pub)
 		if bytes.Equal(h.Sum(nil), certs[0].Signature) {
+			if len(c.mldsa65Verify) != 0 {
+				if c.UConn == nil || c.HandshakeState.Hello == nil || c.HandshakeState.ServerHello == nil {
+					return errors.New("REALITY ML-DSA-65 verification requires handshake transcript")
+				}
+				h.Write(c.HandshakeState.Hello.Raw)
+				h.Write(c.HandshakeState.ServerHello.Raw)
+				var signature []byte
+				for _, extension := range certs[0].Extensions {
+					if extension.Id.Equal([]int{0, 0}) {
+						signature = extension.Value
+						break
+					}
+				}
+				if !utls.RealityMldsa65Verify(c.mldsa65Verify, h.Sum(nil), signature) {
+					return errors.New("REALITY ML-DSA-65 verification failed")
+				}
+			}
 			c.verified = true
 			return nil
 		}
