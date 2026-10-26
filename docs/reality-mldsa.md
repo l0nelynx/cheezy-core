@@ -3,10 +3,18 @@
 ## Dependency and upstream review
 
 The uTLS module is replaced with `github.com/legiz-ru/prizrak-utls` at
-`v0.0.0-20260910220934-80ad70380fe8` (commit `80ad70380fe8` on
-`v1.9.0-mod-meta-mldsa`). The immutable pin preserves the module import path
+`v0.0.0-20261022072945-d5656b84bb52` (commit `d5656b84bb52` on
+`v1.9.0-mod-meta-mldsa-chr155`, checked on 2026-10-26). The immutable pin
+preserves the module import path
 and Go 1.20 compatibility declared by the dependency. It includes the newer
 browser fingerprints and the Xray-compatible REALITY ML-DSA-65 primitive.
+
+`client-fingerprint: chrome` now selects Chrome 155. Its signature schemes
+include randomized GREASE and ML-DSA entries; fingerprint tests normalize
+GREASE while preserving the order and values of real algorithms. The fork
+also carries certificate decompression fixes, MLKEM1024 and the UQUICConn
+error/close synchronization fix. See [the October review](prizrak-review-2026-10-26.md)
+for the comparison with Prizrak-Core and Mihomo Alpha.
 
 Reviewed the latest 60 commits of Prizrak-Core `v1-19-31`, whose head was
 `265a587050f952f645d09474efae8b8173a6679c` on 2026-09-21. Relevant changes:
