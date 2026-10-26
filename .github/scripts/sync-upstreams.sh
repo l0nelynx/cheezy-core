@@ -81,11 +81,19 @@ fi
 git config user.name github-actions[bot]
 git config user.email 41898282+github-actions[bot]@users.noreply.github.com
 git checkout -b "$branch"
+conflicted=false
+conflict_files=""
 if ! git merge --no-ff --no-edit "$source_ref"; then
+  conflict_files="$(git diff --name-only --diff-filter=U)"
+  if [[ -z "$conflict_files" ]]; then
+    echo "Merge failed without conflicted files; refusing to create a conflict PR." >&2
+    exit 1
+  fi
   git merge --abort
-  gh issue create --title "Conflict syncing ${source} Alpha ${short_sha}" \
-    --body "The automated merge into cheezy-wap conflicts and requires local review."
-  exit 0
+  conflicted=true
+  # Expose actual conflicts with the PR base without committing conflict markers.
+  git checkout -B "$branch" "$source_ref"
+  git show "$original:upstream-lock.json" > upstream-lock.json
 fi
 
 tmp="$(mktemp)"
@@ -98,13 +106,32 @@ else
 fi
 mv "$tmp" upstream-lock.json
 git add upstream-lock.json
-git commit --amend --no-edit
+if [[ "$conflicted" == true ]]; then
+  git commit -m "Record proposed ${source} Alpha sync ${short_sha}"
+else
+  git commit --amend --no-edit
+fi
 git push origin "$branch"
 
 draft_args=()
-if [[ "$source" == "metacubex" ]]; then
+if [[ "$source" == "metacubex" || "$conflicted" == true ]]; then
   draft_args+=(--draft)
 fi
+body="$(mktemp)"
+trap 'rm -f "$body"' EXIT
+{
+  printf 'Validated Alpha-only upstream sync.\n\nSource: `%s`\nSource SHA: `%s`\nTarget SHA at validation: `%s`\n' "$source" "$source_sha" "$original"
+  printf '\nManual review and all Cheezy Core checks are required. Merge this PR with a merge commit to preserve upstream ancestry.\n'
+  if [[ "$conflicted" == true ]]; then
+    printf '\n## Conflicts require resolution\n\nThe automatic merge into `cheezy-wap` conflicted. This draft contains the upstream commits and a proposed lock-file update; no conflict markers were committed.\n\nConflicting files at validation:\n\n'
+    while IFS= read -r path; do
+      printf -- '- `%s`\n' "$path"
+    done <<< "$conflict_files"
+    printf '\nResolve using GitHub if its conflict editor is available, or locally:\n\n```bash\ngit fetch origin\ngit switch --track origin/%s\ngit merge origin/cheezy-wap\n# Resolve conflicts, then stage each resolved file.\ngit commit\ngit push origin HEAD\n```\n' "$branch"
+    printf '\nWhen merging the base into this branch, ours is upstream and theirs is Cheezy Core. Preserve Cheezy-specific changes and reconcile `upstream-lock.json` with the source SHA above. Then mark this PR ready for review.\n'
+  fi
+} > "$body"
+
 gh pr create "${draft_args[@]}" --base cheezy-wap --head "$branch" \
   --title "Sync ${source} Alpha ${short_sha}" \
-  --body "Validated Alpha-only upstream sync. Source SHA: ${source_sha}. Manual review and all Cheezy Core checks are required."
+  --body-file "$body"
