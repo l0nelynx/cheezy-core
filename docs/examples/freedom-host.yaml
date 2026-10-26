@@ -1,0 +1,15 @@
+# Merge the outbound and its rule into your existing config.
+mode: rule
+
+proxies:
+  - name: FRAGMENT
+    type: freedom
+    fragment:
+      packets: tlshello
+      length: "100-200"
+      interval: "0"
+
+rules:
+  # Only HTTPS over TCP to this exact host uses FRAGMENT.
+  - AND,((DOMAIN,example.com),(NETWORK,TCP),(DST-PORT,443)),FRAGMENT
+  - MATCH,DIRECT

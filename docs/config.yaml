@@ -1763,6 +1763,23 @@ proxies: # socks5
     type: direct
     interface-name: en1
     routing-mark: 6667
+  # Freedom: DIRECT with optional TLS fragmentation and TCP socket options.
+  # Host-scoped rules and dialer-proxy examples: docs/freedom.md
+  - name: FRAGMENT
+    type: freedom
+    fragment:
+      packets: tlshello
+      length: "100-200"
+      interval: "0"
+      # split: sni # cuts inside SNI labels instead; length is then unnecessary
+      # max-split: "3"
+      # wait: ack # Windows uses fallback-delay instead of ACK statistics
+      # fallback-delay: 500
+    # sockopt:
+    #   tcp-congestion: bbr # Linux/Android only
+    #   tcp-user-timeout: 10000 # ms; Linux/Android only
+    #   tcp-keep-alive-idle: 300 # seconds
+    #   tcp-keep-alive-interval: 60 # seconds
 proxy-groups:
   # url-test 将按照 url 测试结果使用延迟最低节点
   - name: "auto"
