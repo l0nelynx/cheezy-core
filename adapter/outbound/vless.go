@@ -100,6 +100,7 @@ type VlessOption struct {
 	PrivateKey        string            `proxy:"private-key,omitempty"`
 	ServerName        string            `proxy:"servername,omitempty"`
 	ClientFingerprint string            `proxy:"client-fingerprint,omitempty"`
+	Fragment          *FragmentOption   `proxy:"fragment,omitempty"`
 	XrayMux           XrayMuxOption     `proxy:"xray-mux,omitempty"`
 }
 
@@ -619,7 +620,10 @@ func NewVless(option VlessOption) (*Vless, error) {
 		client: client,
 		option: &option,
 	}
-	v.dialer = option.NewDialer(v.DialOptions())
+	v.dialer, err = newFragmentDialer(option.NewDialer(v.DialOptions()), option.Fragment, option.Name)
+	if err != nil {
+		return nil, err
+	}
 
 	v.encryption, err = encryption.NewClient(option.Encryption)
 	if err != nil {
