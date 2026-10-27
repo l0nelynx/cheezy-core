@@ -86,6 +86,7 @@ type VmessOption struct {
 	GlobalPadding       bool             `proxy:"global-padding,omitempty"`
 	AuthenticatedLength bool             `proxy:"authenticated-length,omitempty"`
 	ClientFingerprint   string           `proxy:"client-fingerprint,omitempty"`
+	Fragment            *FragmentOption  `proxy:"fragment,omitempty"`
 }
 
 type MKCPOptions struct {
@@ -514,7 +515,10 @@ func NewVmess(option VmessOption) (*Vmess, error) {
 		client: client,
 		option: &option,
 	}
-	v.dialer = option.NewDialer(v.DialOptions())
+	v.dialer, err = newFragmentDialer(option.NewDialer(v.DialOptions()), option.Fragment, option.Name)
+	if err != nil {
+		return nil, err
+	}
 
 	v.echConfig, err = v.option.ECHOpts.Parse()
 	if err != nil {

@@ -30,6 +30,7 @@ func recordServer(t *testing.T) (*net.TCPAddr, <-chan int) {
 		if err != nil {
 			return
 		}
+		_ = ln.Close() // One capture only; retries must not connect to an unserved listener.
 		defer c.Close()
 		var payload []byte
 		records := 0

@@ -28,15 +28,7 @@ type FreedomOption struct {
 	Sockopt  *FreedomSockoptOption  `proxy:"sockopt,omitempty"`
 }
 
-type FreedomFragmentOption struct {
-	Packets       string `proxy:"packets,omitempty"`
-	Length        string `proxy:"length,omitempty"`
-	Interval      string `proxy:"interval,omitempty"`
-	MaxSplit      string `proxy:"max-split,omitempty"`
-	Split         string `proxy:"split,omitempty"`
-	Wait          string `proxy:"wait,omitempty"`
-	FallbackDelay int    `proxy:"fallback-delay,omitempty"`
-}
+type FreedomFragmentOption = FragmentOption
 
 type FreedomSockoptOption struct {
 	TCPCongestion        string                 `proxy:"tcp-congestion,omitempty"`
@@ -110,20 +102,10 @@ func NewFreedom(option FreedomOption) (*Freedom, error) {
 			loopBack: loopback.NewDetector(),
 		},
 	}
-	if o := option.Fragment; o != nil {
-		cfg, err := fragment.NewConfig(fragment.Option{
-			Packets:       o.Packets,
-			Length:        o.Length,
-			Interval:      o.Interval,
-			MaxSplit:      o.MaxSplit,
-			Split:         o.Split,
-			Wait:          o.Wait,
-			FallbackDelay: o.FallbackDelay,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("%s: %w", option.Name, err)
-		}
-		f.fragment = cfg
+	var err error
+	f.fragment, err = option.Fragment.parse(option.Name)
+	if err != nil {
+		return nil, err
 	}
 	if o := option.Sockopt; o != nil {
 		so := &sockopt.Options{

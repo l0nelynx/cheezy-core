@@ -30,9 +30,30 @@ rules:
 
 При работе через TUN домен должен быть известен ядру: например, из fake-ip DNS mapping или подходящего sniffer. Для подключения только по IP без восстановленного домена правило DOMAIN не совпадёт. В случае ECH `split: sni` видит только доступный внешний ClientHello/SNI.
 
-## Фрагментация соединения к конкретному прокси
+## Fragment прямо в прокси: общий YAML подписки
 
-Создайте тот же `FRAGMENT` и добавьте в **существующий узел** VLESS/Trojan или другой прокси с TCP/TLS:
+VLESS, VMess и Trojan принимают `fragment` непосредственно в своём блоке. Это предпочтительный способ для подписок: отдельный outbound и ссылка `dialer-proxy` не нужны.
+
+Добавьте к существующему узлу:
+
+```yaml
+fragment:
+  packets: tlshello
+  split: sni
+  interval: "1-3"
+```
+
+Остальные поля узла, включая REALITY и smux, остаются прежними. Полный пример с sing-mux: [examples/vless-inline-fragment.yaml](examples/vless-inline-fragment.yaml). При `split: sni` параметр length не используется. Для дробления по длине задайте `split: length` и `length: "100-200"`.
+
+Фрагментатор ставится под TLS/REALITY, на каждое новое TCP-соединение к серверу. Он действует и при smux/Xray mux, а также на TCP-соединения WS/H2/gRPC/XHTTP. Уже установленные соединения не меняются; для проверки перезапустите ядро или пересоздайте carriers. UDP/QUIC-сокеты не фрагментируются.
+
+При наличии собственного `dialer-proxy` inline fragment оборачивает результат этого dialer; второй Freedom с тем же fragment не нужен, иначе получится повторная фрагментация. Для обычного узла достаточно одного inline-блока.
+
+Ядра Mihomo с parser, игнорирующим неизвестные поля, могут принять тот же YAML и работать без фрагментации. Отдельные GUI/converter могут иметь собственную строгую проверку; совместимость каждого клиента определяется им. Обязательных ссылок на отсутствующий outbound этот способ не добавляет.
+
+## Отдельный Freedom через dialer-proxy
+
+Этот вариант остаётся доступен для локальных конфигураций. Создайте `FRAGMENT` и добавьте в существующий узел VLESS/Trojan или другой прокси с TCP/TLS:
 
 ```yaml
 proxies:
@@ -126,5 +147,9 @@ sockopt:
 ## Проверки порта
 
 Тесты покрывают сохранение TLS payload, длины/число records, SNI split, ClientHello в нескольких Write, применение через relay, полноценный HTTPS через proxy dialer, отмену паузы при Close и неизменный UDP. Пример с адресным правилом проверяется конфигурационным тестом: целевой TCP/443 выбирает Freedom, другой хост/порт, поддомен и QUIC — DIRECT.
+
+Inline fragment дополнительно проверяется захватом ClientHello для VLESS/TLS, REALITY, smux, Xray mux, WS/H2/gRPC/XHTTP, VMess и Trojan. Тест подписки проверяет один узел с REALITY/smux/fragment без внешней зависимости dialer-proxy; ошибочные параметры fragment отклоняются при создании узла.
+
+Для inline-порта тесты затронутых пакетов прошли на Go 1.26.3 и 1.20.14. Один и тот же YAML с REALITY, smux и fragment прошёл CLI-проверку `-t` как в Cheezy, так и в неизменённом vernesong/Mihomo Alpha `1f9b2c2b`: stock parser принимает неизвестное поле fragment и не применяет его.
 
 Проверены Go 1.26.3 и Go 1.20.14 на Windows: fragment, adapter/parser, outbound, outboundgroup, config и существующий Xray mux. Полная сборка проходит; YAML-пример проходит CLI-проверку `-t`. Пакеты fragment/sockopt также кросс-компилируются для Linux и macOS; runtime-проверки socket options на этих ОС в этой работе не выполнялись.

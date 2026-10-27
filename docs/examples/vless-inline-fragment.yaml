@@ -1,0 +1,26 @@
+# Replace the example server and credentials with your existing VLESS node.
+mode: rule
+proxies:
+  - name: VLESS-FRAGMENT
+    type: vless
+    server: proxy.example.net
+    port: 443
+    network: tcp
+    udp: true
+    uuid: "00000000-0000-0000-0000-000000000001"
+    packet-encoding: xudp
+    tls: true
+    servername: proxy.example.net
+    client-fingerprint: firefox
+    smux:
+      enabled: true
+      padding: true
+      only-tcp: false
+      protocol: h2mux
+      max-connections: 3
+    fragment:
+      packets: tlshello
+      split: sni
+      interval: "1-3"
+rules:
+  - MATCH,VLESS-FRAGMENT

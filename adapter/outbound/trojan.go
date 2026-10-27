@@ -66,6 +66,7 @@ type TrojanOption struct {
 	WSOpts            WSOptions        `proxy:"ws-opts,omitempty"`
 	SSOpts            TrojanSSOption   `proxy:"ss-opts,omitempty"`
 	ClientFingerprint string           `proxy:"client-fingerprint,omitempty"`
+	Fragment          *FragmentOption  `proxy:"fragment,omitempty"`
 }
 
 // TrojanSSOption from https://github.com/p4gefau1t/trojan-go/blob/v0.10.6/tunnel/shadowsocks/config.go#L5
@@ -303,9 +304,12 @@ func NewTrojan(option TrojanOption) (*Trojan, error) {
 		option:      &option,
 		hexPassword: trojan.Key(option.Password),
 	}
-	t.dialer = option.NewDialer(t.DialOptions())
-
 	var err error
+	t.dialer, err = newFragmentDialer(option.NewDialer(t.DialOptions()), option.Fragment, option.Name)
+	if err != nil {
+		return nil, err
+	}
+
 	t.echConfig, err = option.ECHOpts.Parse()
 	if err != nil {
 		return nil, err
