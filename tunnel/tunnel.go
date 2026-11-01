@@ -41,7 +41,7 @@ const (
 var (
 	status        = atomic.NewInt32Enum(Suspend)
 	udpInit       sync.Once
-	udpQueues     []chan C.PacketAdapter
+	udpQueues     []chan queuedUDPPacket
 	natTable      = nat.New()
 	rules         []C.Rule
 	listeners     = make(map[string]C.InboundListener)
@@ -91,9 +91,9 @@ func initUDP() {
 		numUDPWorkers = num
 	}
 
-	udpQueues = make([]chan C.PacketAdapter, numUDPWorkers)
+	udpQueues = make([]chan queuedUDPPacket, numUDPWorkers)
 	for i := 0; i < numUDPWorkers; i++ {
-		queue := make(chan C.PacketAdapter, queueCapacity)
+		queue := make(chan queuedUDPPacket, queueCapacity)
 		udpQueues[i] = queue
 		go processUDP(queue)
 	}
@@ -107,11 +107,18 @@ func (t tunnel) HandleUDPPacket(packet C.UDPPacket, metadata *C.Metadata) {
 
 	hash := utils.MapHash(key)
 	queueNo := uint(hash) % uint(len(udpQueues))
+	enqueueUDPPacket(udpQueues[queueNo], packetAdapter)
+}
 
+func enqueueUDPPacket(queue chan queuedUDPPacket, packetAdapter C.PacketAdapter) {
+	queued := queuedUDPPacket{packet: packetAdapter, diagnostics: statistic.ActiveUDPDiagnostics()}
+	if queued.diagnostics != nil {
+		queued.queuedAt = time.Now()
+	}
 	select {
-	case udpQueues[queueNo] <- packetAdapter:
+	case queue <- queued:
 	default:
-		packet.Drop()
+		queued.drop(statistic.UDPIngressQueueFull)
 	}
 }
 
@@ -414,9 +421,12 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 }
 
 // processUDP starts a loop to handle udp packet
-func processUDP(queue chan C.PacketAdapter) {
-	for conn := range queue {
-		handleUDPConn(conn)
+func processUDP(queue chan queuedUDPPacket) {
+	for queued := range queue {
+		if queued.diagnostics != nil {
+			queued.diagnostics.ObserveIngressQueue(time.Since(queued.queuedAt))
+		}
+		handleUDPConn(queued.packet)
 	}
 }
 
@@ -702,7 +712,7 @@ func match(metadata *C.Metadata, helper C.RuleMatchHelper) (C.Proxy, C.Rule, err
 					}
 				}
 
-				if ! smart {
+				if !smart {
 					metadata.SmartTarget = ""
 				} else {
 					metadata.SmartBlock = "normal"

@@ -124,6 +124,8 @@ func router(isDebug bool, secret string, dohServer string, cors Cors) *chi.Mux {
 		r.Get("/logs", getLogs)
 		r.Get("/traffic", traffic)
 		r.Get("/memory", memory)
+		r.Get("/udp/diagnostics", getUDPDiagnostics)
+		r.Patch("/udp/diagnostics", patchUDPDiagnostics)
 		r.Get("/version", version)
 		r.Get("/powersave", getPowerSave)
 		r.Patch("/powersave", patchPowerSave)

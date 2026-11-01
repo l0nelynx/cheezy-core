@@ -298,12 +298,17 @@ func NewConn(c net.Conn, a C.ProxyAdapter) C.Conn {
 
 type packetConn struct {
 	N.EnhancePacketConn
-	chain       C.Chain
-	pdChain     C.Chain
-	adapterName string
-	connID      string
-	adapterAddr string
-	resolveUDP  func(ctx context.Context, metadata *C.Metadata) error
+	chain            C.Chain
+	pdChain          C.Chain
+	adapterName      string
+	connID           string
+	adapterAddr      string
+	resolveUDP       func(ctx context.Context, metadata *C.Metadata) error
+	udpMaxQueueDelay time.Duration
+}
+
+func (c *packetConn) UDPMaxQueueDelay() time.Duration {
+	return c.udpMaxQueueDelay
 }
 
 func (c *packetConn) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
@@ -362,7 +367,14 @@ func NewPacketConn(pc net.PacketConn, a ProxyAdapter) C.PacketConn {
 	default:
 		epc = N.NewDeadlineEnhancePacketConn(epc) // most conn from outbound can't handle readDeadline correctly
 	}
-	cpc := &packetConn{epc, nil, nil, a.Name(), utils.NewUUIDV4().String(), a.Addr(), a.ResolveUDP}
+	cpc := &packetConn{
+		EnhancePacketConn: epc,
+		adapterName:       a.Name(), connID: utils.NewUUIDV4().String(),
+		adapterAddr: a.Addr(), resolveUDP: a.ResolveUDP,
+	}
+	if policy, ok := a.(C.UDPQueuePolicy); ok {
+		cpc.udpMaxQueueDelay = policy.UDPMaxQueueDelay()
+	}
 	cpc.AppendToChains(a)
 	return cpc
 }

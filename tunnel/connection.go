@@ -6,17 +6,37 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	N "github.com/metacubex/mihomo/common/net"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
+	"github.com/metacubex/mihomo/tunnel/statistic"
 )
 
+type queuedUDPPacket struct {
+	packet      C.PacketAdapter
+	queuedAt    time.Time
+	diagnostics *statistic.UDPDiagnostics
+}
+
+func (p queuedUDPPacket) drop(reason statistic.UDPDropReason) {
+	p.diagnostics.Drop(reason)
+	p.packet.Drop()
+}
+
+func (p queuedUDPPacket) expired(maxDelay time.Duration) bool {
+	return maxDelay > 0 && !p.queuedAt.IsZero() && time.Since(p.queuedAt) >= maxDelay
+}
+
 type packetSender struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	ch     chan C.PacketAdapter
+	ctx           context.Context
+	cancel        context.CancelFunc
+	ch            chan queuedUDPPacket
+	queueMutex    sync.Mutex // serializes admission with Close, never held during I/O
+	closed        bool
+	maxQueueDelay atomic.Int64 // -1 until the outbound has been established
 
 	// destination NAT mapping
 	originToTarget map[string]netip.Addr
@@ -28,8 +48,8 @@ type packetSender struct {
 // It ensures that packets can be sent sequentially and without blocking
 func newPacketSender() C.PacketSender {
 	ctx, cancel := context.WithCancel(context.Background())
-	ch := make(chan C.PacketAdapter, senderCapacity)
-	return &packetSender{
+	ch := make(chan queuedUDPPacket, senderCapacity)
+	sender := &packetSender{
 		ctx:    ctx,
 		cancel: cancel,
 		ch:     ch,
@@ -37,6 +57,8 @@ func newPacketSender() C.PacketSender {
 		originToTarget: make(map[string]netip.Addr),
 		targetToOrigin: make(map[netip.Addr]netip.Addr),
 	}
+	sender.maxQueueDelay.Store(-1)
+	return sender
 }
 
 func (s *packetSender) AddMapping(originMetadata *C.Metadata, metadata *C.Metadata) {
@@ -62,8 +84,20 @@ func (s *packetSender) RestoreReadFrom(addr netip.Addr) netip.Addr {
 	return addr
 }
 
-func (s *packetSender) processPacket(pc C.PacketConn, packet C.PacketAdapter) {
+func (s *packetSender) processPacket(pc C.PacketConn, proxy C.WriteBackProxy, queued queuedUDPPacket, maxDelay time.Duration) {
+	packet := queued.packet
 	defer packet.Drop()
+	if queued.diagnostics != nil && !queued.queuedAt.IsZero() {
+		queued.diagnostics.ObserveSenderQueue(time.Since(queued.queuedAt))
+	}
+	if s.ctx.Err() != nil {
+		queued.diagnostics.Drop(statistic.UDPSenderClosed)
+		return
+	}
+	if queued.expired(maxDelay) {
+		queued.diagnostics.Drop(statistic.UDPQueueExpired)
+		return
+	}
 	metadata := packet.Metadata()
 
 	var addr *net.UDPAddr
@@ -86,31 +120,60 @@ func (s *packetSender) processPacket(pc C.PacketConn, packet C.PacketAdapter) {
 			// TODO: ResolveUDP may take a long time to block the Process loop
 			//       but we want keep sequence sending so can't open a new goroutine
 			if err := pc.ResolveUDP(s.ctx, metadata); err != nil {
+				queued.diagnostics.Drop(statistic.UDPResolveError)
 				log.Warnln("[UDP] Resolve Ip error: %s", err)
 				return
 			}
 		}
 
 		if !metadata.DstIP.IsValid() {
+			queued.diagnostics.Drop(statistic.UDPResolveError)
 			log.Warnln("[UDP] Destination ip not valid: %#v", metadata)
 			return
 		}
 		s.AddMapping(originMetadata, metadata)
 		addr = metadata.UDPAddr()
 	}
-	_ = handleUDPToRemote(packet, pc, addr)
+	// Resolution can block after dequeueing. Do not send a packet that has
+	// expired in the meantime. The transport's WriteTo itself is not cancellable.
+	if s.ctx.Err() != nil {
+		queued.diagnostics.Drop(statistic.UDPSenderClosed)
+		return
+	}
+	if queued.expired(maxDelay) {
+		queued.diagnostics.Drop(statistic.UDPQueueExpired)
+		return
+	}
+	if proxy != nil {
+		proxy.UpdateWriteBack(packet)
+	}
+	var started time.Time
+	if queued.diagnostics != nil {
+		started = time.Now()
+	}
+	err := handleUDPToRemote(packet, pc, addr)
+	if queued.diagnostics != nil {
+		queued.diagnostics.ObserveOutboundWrite(time.Since(started))
+		if err != nil {
+			queued.diagnostics.Drop(statistic.UDPWriteError)
+		}
+	}
 }
 
 func (s *packetSender) Process(pc C.PacketConn, proxy C.WriteBackProxy) {
+	var maxDelay time.Duration
+	if policy, ok := N.FindUpstream[C.UDPQueuePolicy](pc, func(policy C.UDPQueuePolicy) bool {
+		return policy.UDPMaxQueueDelay() > 0
+	}); ok {
+		maxDelay = policy.UDPMaxQueueDelay()
+	}
+	s.maxQueueDelay.Store(int64(maxDelay))
 	for {
 		select {
 		case <-s.ctx.Done():
 			return // sender closed
 		case packet := <-s.ch:
-			if proxy != nil {
-				proxy.UpdateWriteBack(packet)
-			}
-			s.processPacket(pc, packet)
+			s.processPacket(pc, proxy, packet, maxDelay)
 		}
 	}
 }
@@ -119,7 +182,7 @@ func (s *packetSender) dropAll() {
 	for {
 		select {
 		case data := <-s.ch:
-			data.Drop() // drop all data still in chan
+			data.drop(statistic.UDPSenderClosed)
 		default:
 			return // no data, exit goroutine
 		}
@@ -127,25 +190,36 @@ func (s *packetSender) dropAll() {
 }
 
 func (s *packetSender) Send(packet C.PacketAdapter) {
-	select {
-	case <-s.ctx.Done():
-		packet.Drop() // sender closed before Send()
+	queued := queuedUDPPacket{packet: packet, diagnostics: statistic.ActiveUDPDiagnostics()}
+	s.queueMutex.Lock()
+	if s.closed {
+		s.queueMutex.Unlock()
+		queued.drop(statistic.UDPSenderClosed)
 		return
-	default:
 	}
-
+	// Preserve timestamps during connection setup: the eventual outbound may
+	// opt into expiry. Established sessions without either feature skip clocks.
+	if s.maxQueueDelay.Load() != 0 || queued.diagnostics != nil {
+		queued.queuedAt = time.Now()
+	}
 	select {
-	case s.ch <- packet:
-		// put ok, so don't drop packet, will process by other side of chan
-	case <-s.ctx.Done():
-		packet.Drop() // sender closed when putting data to chan
+	case s.ch <- queued:
+		s.queueMutex.Unlock()
 	default:
-		packet.Drop() // chan is full
+		s.queueMutex.Unlock()
+		queued.drop(statistic.UDPSenderQueueFull)
 	}
 }
 
 func (s *packetSender) Close() {
+	s.queueMutex.Lock()
+	if s.closed {
+		s.queueMutex.Unlock()
+		return
+	}
+	s.closed = true
 	s.cancel()
+	s.queueMutex.Unlock()
 	s.dropAll()
 }
 
@@ -202,6 +276,7 @@ func handleUDPToLocal(writeBack C.WriteBack, pc C.PacketConn, sender C.PacketSen
 			put()
 		}
 		if err != nil {
+			statistic.ActiveUDPDiagnostics().Drop(statistic.UDPWriteBackError)
 			return
 		}
 	}

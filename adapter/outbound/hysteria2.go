@@ -36,7 +36,8 @@ type Hysteria2 struct {
 	option *Hysteria2Option
 	client *hysteria2.Client
 
-	activity sessionActivity
+	activity         sessionActivity
+	udpMaxQueueDelay time.Duration
 }
 
 type Hysteria2Option struct {
@@ -65,6 +66,7 @@ type Hysteria2Option struct {
 	BBRProfile        string     `proxy:"bbr-profile,omitempty"`
 	UdpMTU            int        `proxy:"udp-mtu,omitempty"`
 	HandshakeTimeout  int        `proxy:"handshake-timeout,omitempty"`
+	UDPMaxQueueDelay  string     `proxy:"udp-max-queue-delay,omitempty"`
 
 	RealmOpts Hysteria2RealmOption `proxy:"realm-opts,omitempty"`
 
@@ -158,7 +160,19 @@ func (h *Hysteria2) ProxyInfo() C.ProxyInfo {
 	return info
 }
 
+func (h *Hysteria2) UDPMaxQueueDelay() time.Duration {
+	return h.udpMaxQueueDelay
+}
+
 func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
+	var udpMaxQueueDelay time.Duration
+	if option.UDPMaxQueueDelay != "" {
+		var err error
+		udpMaxQueueDelay, err = time.ParseDuration(option.UDPMaxQueueDelay)
+		if err != nil || udpMaxQueueDelay < 0 {
+			return nil, fmt.Errorf("invalid udp-max-queue-delay %q: expected a non-negative duration such as 50ms", option.UDPMaxQueueDelay)
+		}
+	}
 	addr := net.JoinHostPort(option.Server, strconv.Itoa(option.Port))
 	outbound := &Hysteria2{
 		Base: NewBase(BaseOption{
@@ -171,7 +185,8 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
 			RoutingMark:  option.RoutingMark,
 			Prefer:       option.IPVersion,
 		}),
-		option: &option,
+		option:           &option,
+		udpMaxQueueDelay: udpMaxQueueDelay,
 	}
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
 
