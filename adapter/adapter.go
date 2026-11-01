@@ -164,6 +164,11 @@ func (p *Proxy) MarshalJSON() ([]byte, error) {
 	mapping["alive"] = p.alive.Load()
 	mapping["name"] = p.Name()
 	mapping["udp"] = p.SupportUDP()
+	if reporter, ok := p.ProxyAdapter.(C.OuterQUICReporter); ok {
+		if quality := reporter.OuterQUIC(); quality != nil {
+			mapping["outerQuic"] = quality
+		}
+	}
 	mapping["uot"] = p.SupportUOT()
 
 	proxyInfo := p.ProxyInfo()

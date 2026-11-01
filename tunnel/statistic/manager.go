@@ -106,7 +106,7 @@ func (m *Manager) Memory() uint64 {
 func (m *Manager) Snapshot() *Snapshot {
 	var connections []*TrackerInfo
 	m.Range(func(c Tracker) bool {
-		connections = append(connections, c.Info())
+		connections = append(connections, c.Info().snapshot())
 		return true
 	})
 	return &Snapshot{

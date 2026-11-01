@@ -29,8 +29,46 @@ func groupRouter() http.Handler {
 		r.Get("/", getGroup)
 		r.Get("/delay", getGroupDelay)
 		r.Get("/weights", getGroupWeights)
+		r.Get("/bindings", getAntiLagBindings)
+		r.Post("/failover", switchAntiLagBinding)
 	})
 	return r
+}
+
+func getAntiLagBindings(w http.ResponseWriter, r *http.Request) {
+	g, ok := r.Context().Value(CtxKeyProxy).(C.Proxy).Adapter().(*outboundgroup.AntiLag)
+	if !ok {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, newError("group must be antilag"))
+		return
+	}
+	render.JSON(w, r, g.Bindings())
+}
+
+func switchAntiLagBinding(w http.ResponseWriter, r *http.Request) {
+	g, ok := r.Context().Value(CtxKeyProxy).(C.Proxy).Adapter().(*outboundgroup.AntiLag)
+	if !ok {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, newError("group must be antilag"))
+		return
+	}
+	var request struct {
+		ID        string `json:"id"`
+		Candidate string `json:"candidate"`
+	}
+	if err := render.DecodeJSON(r.Body, &request); err != nil || request.ID == "" || request.Candidate == "" {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, newError("id and candidate are required"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), C.DefaultUDPTimeout)
+	defer cancel()
+	if err := g.Failover(ctx, request.ID, request.Candidate); err != nil {
+		render.Status(r, http.StatusConflict)
+		render.JSON(w, r, newError(err.Error()))
+		return
+	}
+	render.NoContent(w, r)
 }
 
 func getGroups(w http.ResponseWriter, r *http.Request) {
@@ -164,9 +202,9 @@ func getAllGroupWeights(w http.ResponseWriter, r *http.Request) {
 	errorsMap := make(map[string]string)
 
 	var (
-		mu    sync.Mutex
-		wg    sync.WaitGroup
-		sem   = make(chan struct{}, 5)
+		mu  sync.Mutex
+		wg  sync.WaitGroup
+		sem = make(chan struct{}, 5)
 	)
 
 	for _, p := range tunnel.Proxies() {

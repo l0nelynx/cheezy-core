@@ -44,6 +44,7 @@ const (
 
 type wireguardGoDevice interface {
 	Close()
+	Up() error
 	IpcSet(uapiConf string) error
 }
 
@@ -599,6 +600,13 @@ func (w *WireGuard) init0(ctx context.Context) (err error) {
 	defer w.deviceMutex.Unlock()
 	err = w.runCtx.Err()
 	if err != nil {
+		return err
+	}
+	// Start publishes a TUN event asynchronously. Do not return a usable
+	// UDP socket before the peer is running: WireGuard discards unstaged
+	// packets received from the stack during that gap. Up is idempotent.
+	if err = wgDevice.Up(); err != nil {
+		w.initErr = err
 		return err
 	}
 	w.device, w.tunDevice = wgDevice, tunDevice

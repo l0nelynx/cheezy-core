@@ -81,7 +81,7 @@ func (r ASNReader) LookupASN(ip net.IP) (string, string) {
 	case "ipinfo generic_asn_free.mmdb":
 		var result IPInfo
 		_ = r.Lookup(ip, &result)
-		return result.ASN[2:], result.Name
+		return strings.TrimPrefix(result.ASN, "AS"), result.Name
 	default:
 		log.Warnln("Unsupported ASN type: %s", r.Metadata.DatabaseType)
 	}

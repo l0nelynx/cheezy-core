@@ -13,6 +13,7 @@ import (
 	C "github.com/metacubex/mihomo/constant"
 
 	"github.com/gofrs/uuid/v5"
+	"golang.org/x/exp/slices"
 )
 
 type Tracker interface {
@@ -37,6 +38,8 @@ type bucketWindow struct {
 }
 
 type TrackerInfo struct {
+	udpRoutes       C.UDPRouteReporter
+	Routes          []C.UDPRoute `json:"udpRoutes,omitempty"`
 	UUID            uuid.UUID    `json:"id"`
 	Metadata        *C.Metadata  `json:"metadata"`
 	UploadTotal     atomic.Int64 `json:"upload"`
@@ -48,6 +51,34 @@ type TrackerInfo struct {
 	RulePayload     string       `json:"rulePayload"`
 	MaxUploadRate   atomic.Int64 `json:"maxUploadRate"`
 	MaxDownloadRate atomic.Int64 `json:"maxDownloadRate"`
+}
+
+func (info *TrackerInfo) snapshot() *TrackerInfo {
+	if info.udpRoutes == nil {
+		return info
+	}
+	routes := info.udpRoutes.UDPRoutes()
+	chain, providers := info.Chain, info.ProviderChain
+	uniform := len(routes) > 0
+	for i := range routes {
+		// UDPRoutes returns owned slices. The enclosing connection contributes
+		// the AntiLag group and any groups that selected it.
+		routes[i].Chains = append(routes[i].Chains, info.Chain...)
+		routes[i].ProviderChains = append(routes[i].ProviderChains, info.ProviderChain...)
+		uniform = uniform && slices.Equal(routes[i].Chains, routes[0].Chains) && slices.Equal(routes[i].ProviderChains, routes[0].ProviderChains)
+	}
+	if uniform {
+		chain, providers = routes[0].Chains, routes[0].ProviderChains
+	}
+	return &TrackerInfo{
+		UUID: info.UUID, Metadata: info.Metadata, Start: info.Start,
+		Rule: info.Rule, RulePayload: info.RulePayload,
+		Chain: chain, ProviderChain: providers, Routes: routes,
+		UploadTotal:     atomic.NewInt64(info.UploadTotal.Load()),
+		DownloadTotal:   atomic.NewInt64(info.DownloadTotal.Load()),
+		MaxUploadRate:   atomic.NewInt64(info.MaxUploadRate.Load()),
+		MaxDownloadRate: atomic.NewInt64(info.MaxDownloadRate.Load()),
+	}
 }
 
 type tcpTracker struct {
@@ -249,6 +280,7 @@ func (ut *udpTracker) Upstream() any {
 }
 
 func NewUDPTracker(conn C.PacketConn, manager *Manager, metadata *C.Metadata, rule C.Rule, uploadTotal int64, downloadTotal int64, pushToManager bool) *udpTracker {
+	routes, _ := N.FindUpstream[C.UDPRouteReporter](conn, nil)
 	metadata.RemoteDst = conn.RemoteDestination()
 
 	trackerUUID := utils.NewUUIDV4()
@@ -259,6 +291,7 @@ func NewUDPTracker(conn C.PacketConn, manager *Manager, metadata *C.Metadata, ru
 		PacketConn: conn,
 		manager:    manager,
 		TrackerInfo: &TrackerInfo{
+			udpRoutes:     routes,
 			UUID:          trackerUUID,
 			Start:         time.Now(),
 			Metadata:      metadata,

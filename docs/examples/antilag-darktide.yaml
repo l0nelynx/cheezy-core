@@ -1,0 +1,10 @@
+# Merge into the existing profile. Put the process rule before other matching rules.
+proxy-groups:
+  - name: Darktide-AntiLag
+    type: antilag
+    proxies:
+      - "🇳🇱 #4 Hysteria"
+      - "🇳🇱 #2 Hysteria"
+
+rules:
+  - PROCESS-NAME,Darktide.exe,Darktide-AntiLag
