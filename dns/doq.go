@@ -17,6 +17,7 @@ import (
 	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/constant/features"
 	"github.com/metacubex/mihomo/log"
 
 	"github.com/metacubex/quic-go"
@@ -56,8 +57,9 @@ type dnsOverQUIC struct {
 
 	// conn is the current active QUIC connection.  It can be closed and
 	// re-opened when needed.
-	conn   *quic.Conn
-	connMu sync.RWMutex
+	conn     *quic.Conn
+	connMu   sync.RWMutex
+	activity sync.RWMutex
 
 	addr           string
 	dialer         *dnsDialer
@@ -92,6 +94,10 @@ func newDoQ(addr string, resolver resolver.Resolver, params map[string]string, p
 func (doq *dnsOverQUIC) Address() string { return doq.addr }
 
 func (doq *dnsOverQUIC) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, err error) {
+	if features.WithPowerSave {
+		doq.activity.RLock()
+		defer doq.activity.RUnlock()
+	}
 	// When sending queries over a QUIC connection, the DNS Message ID MUST be
 	// set to zero.
 	m = m.Copy()
@@ -151,6 +157,14 @@ func (doq *dnsOverQUIC) Close() (err error) {
 }
 
 func (doq *dnsOverQUIC) ResetConnection() {
+	doq.closeConnWithError(nil)
+}
+
+func (doq *dnsOverQUIC) CloseIdleQUICConnections() {
+	if !doq.activity.TryLock() {
+		return
+	}
+	defer doq.activity.Unlock()
 	doq.closeConnWithError(nil)
 }
 
@@ -362,7 +376,7 @@ func (doq *dnsOverQUIC) openConnection(ctx context.Context) (quicConn *quic.Conn
 	transport := quic.Transport{Conn: packetConn}
 	transport.SetCreatedConn(true) // auto close conn
 	transport.SetSingleUse(true)   // auto close transport
-	quicConn, err = transport.Dial(ctx, &udpAddr, tlsConfig, doq.getQUICConfig())
+	quicConn, err = transport.Dial(ctx, &udpAddr, tlsConfig, quietQUICConfig(doq.getQUICConfig()))
 	if err != nil {
 		_ = packetConn.Close()
 		return nil, fmt.Errorf("opening quic connection to %s: %w", doq.addr, err)

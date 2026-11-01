@@ -1,12 +1,15 @@
 package statistic
 
 import (
+	"context"
 	"os"
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/xsync"
 	"github.com/metacubex/mihomo/component/memory"
+	"github.com/metacubex/mihomo/component/powersave"
+	"github.com/metacubex/mihomo/constant/features"
 )
 
 var DefaultManager *Manager
@@ -21,8 +24,11 @@ func init() {
 		downloadTotal: atomic.NewInt64(0),
 		pid:           int32(os.Getpid()),
 	}
+	if features.WithPowerSave {
+		DefaultManager.trafficWake = make(chan struct{}, 1)
+	}
 
-	go DefaultManager.handle()
+	go DefaultManager.handle(context.Background(), time.Second)
 }
 
 type Manager struct {
@@ -36,6 +42,8 @@ type Manager struct {
 	downloadTotal atomic.Int64
 	pid           int32
 	memory        uint64
+	paused        atomic.Bool
+	trafficWake   chan struct{}
 }
 
 func (m *Manager) Join(c Tracker) {
@@ -64,11 +72,22 @@ func (m *Manager) Range(f func(c Tracker) bool) {
 func (m *Manager) PushUploaded(size int64) {
 	m.uploadTemp.Add(size)
 	m.uploadTotal.Add(size)
+	m.wakeOnTraffic(size)
 }
 
 func (m *Manager) PushDownloaded(size int64) {
 	m.downloadTemp.Add(size)
 	m.downloadTotal.Add(size)
+	m.wakeOnTraffic(size)
+}
+
+func (m *Manager) wakeOnTraffic(size int64) {
+	if features.WithPowerSave && size > 0 && m.paused.Load() {
+		select {
+		case m.trafficWake <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func (m *Manager) Now() (up int64, down int64) {
@@ -115,12 +134,42 @@ func (m *Manager) ResetStatistic() {
 	m.downloadTotal.Store(0)
 }
 
-func (m *Manager) handle() {
-	ticker := time.NewTicker(time.Second)
+func (m *Manager) handle(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	defer m.paused.Store(false)
 
-	for range ticker.C {
-		m.uploadBlip.Store(m.uploadTemp.Swap(0))
-		m.downloadBlip.Store(m.downloadTemp.Swap(0))
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		up, down := m.uploadTemp.Swap(0), m.downloadTemp.Swap(0)
+		m.uploadBlip.Store(up)
+		m.downloadBlip.Store(down)
+
+		// Publish zero once, then sleep until the mode changes or new traffic
+		// arrives. Arm the wake-up before checking the counters to avoid losing
+		// a packet arriving between the last tick and going to sleep.
+		if features.WithPowerSave && up == 0 && down == 0 && powersave.Current() != powersave.Active {
+			ticker.Stop()
+			m.paused.Store(true)
+			for {
+				changed := powersave.Changed()
+				if powersave.Current() == powersave.Active || m.uploadTemp.Load() != 0 || m.downloadTemp.Load() != 0 {
+					break
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-changed:
+				case <-m.trafficWake:
+				}
+			}
+			m.paused.Store(false)
+			ticker.Reset(interval)
+		}
 	}
 }
 
@@ -176,4 +225,3 @@ func (m *Manager) RangeSmartTarget(target string, fn func(id string) bool) {
 		})
 	}
 }
-

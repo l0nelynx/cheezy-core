@@ -109,13 +109,36 @@ func (t *PoolClient) getClient(udp bool) Client {
 			}
 			it = it.Next()
 		}
+		if bestClient != nil {
+			// Mark the selected client before releasing the pool lock shared
+			// with CloseIdle, including the gap before DialContext starts.
+			bestClient.SetLastVisited(time.Now())
+		}
 	}()
 
 	if bestClient == nil {
 		return t.newClient(udp)
 	} else {
-		bestClient.SetLastVisited(time.Now())
 		return bestClient
+	}
+}
+
+// CloseIdle drops the QUIC connection of every client without an open stream
+// that nothing has asked for in idle (getClient marks the use before a dial,
+// so a dial in progress is never cut).
+func (t *PoolClient) CloseIdle(idle time.Duration) {
+	for _, pair := range []struct {
+		clients *list.List[Client]
+		mutex   *sync.Mutex
+	}{{&t.tcpClients, &t.tcpClientsMutex}, {&t.udpClients, &t.udpClientsMutex}} {
+		pair.mutex.Lock()
+		for it := pair.clients.Front(); it != nil; it = it.Next() {
+			client := it.Value
+			if client != nil && client.OpenStreams() == 0 && time.Since(client.LastVisited()) >= idle {
+				client.CloseIdle()
+			}
+		}
+		pair.mutex.Unlock()
 	}
 }
 
