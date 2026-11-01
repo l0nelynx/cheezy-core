@@ -9,7 +9,9 @@ import (
 	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/singledo"
 	"github.com/metacubex/mihomo/common/utils"
+	"github.com/metacubex/mihomo/component/powersave"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/constant/features"
 	"github.com/metacubex/mihomo/log"
 
 	"github.com/dlclark/regexp2"
@@ -37,27 +39,93 @@ type HealthCheck struct {
 	lazy           bool
 	expectedStatus utils.IntRanges[uint16]
 	lastTouch      atomic.TypedValue[time.Time]
+	lastCheck      atomic.TypedValue[time.Time]
 	singleDo       *singledo.Single[struct{}]
 	timeout        time.Duration
 }
 
+// Checks after failed dials are not scheduled checks and run in every mode.
+const backgroundInterval = 30 * time.Minute
+
 func (hc *HealthCheck) process() {
+	if features.WithPowerSave {
+		hc.processPowerSave()
+		return
+	}
 	ticker := time.NewTicker(hc.interval)
+	defer ticker.Stop()
 	go hc.check()
 	for {
 		select {
 		case <-ticker.C:
-			lastTouch := hc.lastTouch.Load()
-			since := time.Since(lastTouch)
-			if !hc.lazy || since < hc.interval {
-				hc.check()
-			} else {
-				log.Debugln("Skip once health check because we are lazy")
-			}
+			hc.scheduledCheck()
 		case <-hc.ctx.Done():
-			ticker.Stop()
 			return
 		}
+	}
+}
+
+func (hc *HealthCheck) processPowerSave() {
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	first := true
+	var scheduled time.Time
+	for {
+		changed := powersave.Changed()
+		mode := powersave.Current()
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		var tick <-chan time.Time
+		if mode != powersave.Idle {
+			interval := hc.interval
+			if mode == powersave.Background && interval < backgroundInterval {
+				interval = backgroundInterval
+			}
+			last := scheduled
+			if checked := hc.lastCheck.Load(); checked.After(last) {
+				last = checked
+			}
+			delay := time.Until(last.Add(interval))
+			if first || delay < 0 {
+				delay = 0
+			}
+			timer.Reset(delay)
+			tick = timer.C
+		}
+		select {
+		case <-hc.ctx.Done():
+			return
+		case <-changed:
+			// Recalculate from the last check instead of retaining an old tick:
+			// resume catches up once and Idle has no periodic wake-ups.
+		case <-tick:
+			// A mode change may arrive with the timer. Check again before
+			// starting network work, then recalculate on the next iteration.
+			if powersave.Current() != mode {
+				continue
+			}
+			scheduled = time.Now()
+			if first {
+				first = false
+				hc.check()
+			} else {
+				hc.scheduledCheck()
+			}
+		}
+	}
+}
+
+func (hc *HealthCheck) scheduledCheck() {
+	lastTouch := hc.lastTouch.Load()
+	since := time.Since(lastTouch)
+	if !hc.lazy || since < hc.interval {
+		hc.check()
+	} else {
+		log.Debugln("Skip once health check because we are lazy")
 	}
 }
 
@@ -142,6 +210,7 @@ func (hc *HealthCheck) check() {
 			}
 		}
 		_ = b.Wait()
+		hc.lastCheck.Store(time.Now())
 		log.Debugln("Finish A Health Checking {%s}", id)
 		return struct{}{}, nil
 	})

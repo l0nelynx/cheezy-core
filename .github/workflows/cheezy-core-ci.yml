@@ -24,4 +24,10 @@ jobs:
         run: test "$(sed -n '1p' go.mod)" = "module github.com/metacubex/mihomo"
       - name: Test
         run: go test ./...
+      - name: Test power save
+        run: go test -tags with_powersave ./component/powersave ./component/resolver ./adapter/provider ./adapter/outbound ./transport/tuic/... ./dns ./tunnel/... ./log ./hub/route
+      - name: Test power-save concurrency
+        run: go test -race -tags with_powersave ./component/powersave ./adapter/provider ./adapter/outbound ./transport/tuic/... ./dns ./tunnel/statistic ./log ./hub/route
+      - name: Build power save with gVisor
+        run: go build -tags with_gvisor,with_powersave ./...
 

@@ -16,6 +16,7 @@ import (
 	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/constant/features"
 	"github.com/metacubex/mihomo/log"
 
 	"github.com/metacubex/http"
@@ -36,9 +37,9 @@ const (
 	// connections in HTTP transport.
 	transportDefaultIdleConnTimeout = 5 * time.Minute
 
-	dialTimeout        = 10 * time.Second
+	dialTimeout = 10 * time.Second
 
-	maxElapsedTime  = time.Second * 30
+	maxElapsedTime = time.Second * 30
 )
 
 var DefaultHTTPVersions = []C.HTTPVersion{C.HTTPVersion11, C.HTTPVersion2}
@@ -51,6 +52,7 @@ type dnsOverHTTPS struct {
 	// needed. Clients are safe for concurrent use by multiple goroutines.
 	client   *http.Client
 	clientMu sync.Mutex
+	activity sync.RWMutex
 
 	// quicConfig is the QUIC configuration that is used if HTTP/3 is enabled
 	// for this upstream.
@@ -107,6 +109,10 @@ func (doh *dnsOverHTTPS) Address() string {
 }
 
 func (doh *dnsOverHTTPS) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, err error) {
+	if features.WithPowerSave {
+		doh.activity.RLock()
+		defer doh.activity.RUnlock()
+	}
 	// Quote from https://www.rfc-editor.org/rfc/rfc8484.html:
 	// In order to maximize HTTP cache friendliness, DoH clients using media
 	// formats that include the ID field from the DNS message header, such
@@ -567,7 +573,7 @@ func (doh *dnsOverHTTPS) dialQuic(ctx context.Context, addr string, tlsCfg *tls.
 		// It's ok if net.SplitHostPort returns an error - it could be a hostname/IP address without a port.
 		tlsCfg.ServerName = doh.url.Host
 	}
-	quicConn, err := transport.DialEarly(ctx, &udpAddr, tlsCfg, cfg)
+	quicConn, err := transport.DialEarly(ctx, &udpAddr, tlsCfg, quietQUICConfig(cfg))
 	if err != nil {
 		_ = packetConn.Close()
 		return nil, err

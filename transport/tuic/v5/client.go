@@ -16,6 +16,7 @@ import (
 	"github.com/metacubex/mihomo/common/pool"
 	"github.com/metacubex/mihomo/common/xsync"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/constant/features"
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/transport/tuic/types"
 
@@ -38,6 +39,7 @@ type clientImpl struct {
 
 	quicConn  *quic.Conn
 	connMutex sync.Mutex
+	useMutex  sync.RWMutex
 
 	openStreams atomic.Int64
 	closed      atomic.Bool
@@ -234,6 +236,7 @@ func (t *clientImpl) deferQuicConn(quicConn *quic.Conn, err error) {
 func (t *clientImpl) forceClose(quicConn *quic.Conn, err error) {
 	t.connMutex.Lock()
 	defer t.connMutex.Unlock()
+	current := quicConn == nil || quicConn == t.quicConn
 	if quicConn == nil {
 		quicConn = t.quicConn
 	}
@@ -249,6 +252,9 @@ func (t *clientImpl) forceClose(quicConn *quic.Conn, err error) {
 	if quicConn != nil {
 		_ = quicConn.CloseWithError(ProtocolError, errStr)
 	}
+	if !current {
+		return // An old session must not close a new session's UDP streams.
+	}
 	udpInputMap := &t.udpInputMap
 	udpInputMap.Range(func(key uint16, value net.Conn) bool {
 		conn := value
@@ -256,6 +262,21 @@ func (t *clientImpl) forceClose(quicConn *quic.Conn, err error) {
 		udpInputMap.Delete(key)
 		return true
 	})
+}
+
+func (t *clientImpl) CloseIdle() {
+	if !features.WithPowerSave || !t.useMutex.TryLock() {
+		return
+	}
+	defer t.useMutex.Unlock()
+	t.connMutex.Lock()
+	defer t.connMutex.Unlock()
+	if t.quicConn != nil && t.openStreams.Load() == 0 {
+		log.Debugln("[TUIC] closing the idle connection of client %p", t)
+		conn := t.quicConn
+		t.quicConn = nil
+		_ = conn.CloseWithError(ProtocolError, types.ClientIdle.Error())
+	}
 }
 
 func (t *clientImpl) Close() {
@@ -266,6 +287,10 @@ func (t *clientImpl) Close() {
 }
 
 func (t *clientImpl) DialContext(ctx context.Context, metadata *C.Metadata) (net.Conn, error) {
+	if features.WithPowerSave {
+		t.useMutex.RLock()
+		defer t.useMutex.RUnlock()
+	}
 	quicConn, err := t.getQuicConn(ctx)
 	if err != nil {
 		return nil, err
@@ -319,6 +344,10 @@ func (t *clientImpl) DialContext(ctx context.Context, metadata *C.Metadata) (net
 }
 
 func (t *clientImpl) ListenPacket(ctx context.Context, metadata *C.Metadata) (net.PacketConn, error) {
+	if features.WithPowerSave {
+		t.useMutex.RLock()
+		defer t.useMutex.RUnlock()
+	}
 	quicConn, err := t.getQuicConn(ctx)
 	if err != nil {
 		return nil, err

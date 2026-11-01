@@ -7,6 +7,7 @@ import (
 
 type dnsPolicy interface {
 	Match(domain string) []dnsClient
+	closeIdleQUICConnections()
 }
 
 type domainTriePolicy struct {
@@ -21,6 +22,13 @@ func (p domainTriePolicy) Match(domain string) []dnsClient {
 	return nil
 }
 
+func (p domainTriePolicy) closeIdleQUICConnections() {
+	p.Foreach(func(_ string, clients []dnsClient) bool {
+		closeIdleQUICClients(clients)
+		return true
+	})
+}
+
 type domainMatcherPolicy struct {
 	matcher    C.DomainMatcher
 	dnsClients []dnsClient
@@ -31,4 +39,8 @@ func (p domainMatcherPolicy) Match(domain string) []dnsClient {
 		return p.dnsClients
 	}
 	return nil
+}
+
+func (p domainMatcherPolicy) closeIdleQUICConnections() {
+	closeIdleQUICClients(p.dnsClients)
 }

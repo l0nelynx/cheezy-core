@@ -244,6 +244,16 @@ func ResetConnection() {
 	go SystemResolver.ResetConnection() // SystemResolver unneeded check nil
 }
 
+// CloseIdleQUICConnections asks resolvers supporting power save to drop idle
+// QUIC sessions, without resetting other DNS transports or in-flight queries.
+func CloseIdleQUICConnections() {
+	for _, r := range []Resolver{DefaultResolver, SystemResolver} {
+		if closer, ok := r.(interface{ CloseIdleQUICConnections() }); ok {
+			closer.CloseIdleQUICConnections()
+		}
+	}
+}
+
 func SortationAddr(ips []netip.Addr) (ipv4s, ipv6s []netip.Addr) {
 	for _, v := range ips {
 		if v.Unmap().Is4() {

@@ -14,6 +14,7 @@ import (
 	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/constant/features"
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/transport/tuic/common"
 
@@ -34,6 +35,8 @@ type Hysteria2 struct {
 
 	option *Hysteria2Option
 	client *hysteria2.Client
+
+	activity sessionActivity
 }
 
 type Hysteria2Option struct {
@@ -90,9 +93,18 @@ type Hysteria2RealmOption struct {
 }
 
 func (h *Hysteria2) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
+	if features.WithPowerSave {
+		h.activity.acquire()
+	}
 	c, err := h.client.DialConn(ctx, M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
 	if err != nil {
+		if features.WithPowerSave {
+			h.activity.release()
+		}
 		return nil, err
+	}
+	if features.WithPowerSave {
+		c = &countedConn{Conn: c, release: h.activity.release}
 	}
 	return NewConn(c, h), nil
 }
@@ -101,14 +113,34 @@ func (h *Hysteria2) ListenPacketContext(ctx context.Context, metadata *C.Metadat
 	if err = h.ResolveUDP(ctx, metadata); err != nil {
 		return nil, err
 	}
+	if features.WithPowerSave {
+		h.activity.acquire()
+	}
 	pc, err := h.client.ListenPacket(ctx)
+	if features.WithPowerSave && (err != nil || pc == nil) {
+		h.activity.release()
+	}
 	if err != nil {
 		return nil, err
 	}
 	if pc == nil {
 		return nil, errors.New("packetConn is nil")
 	}
+	if features.WithPowerSave {
+		pc = &countedPacketConn{PacketConn: pc, release: h.activity.release}
+	}
 	return NewPacketConn(N.NewThreadSafePacketConn(pc), h), nil
+}
+
+// CloseIdle implements C.IdleCloser
+func (h *Hysteria2) CloseIdle(idle time.Duration) {
+	if !features.WithPowerSave || h.client == nil {
+		return
+	}
+	h.activity.closeIdle(idle, func() {
+		log.Debugln("[Hysteria2] %s: closing the idle session", h.Name())
+		_ = h.client.CloseWithError(errIdleSession)
+	})
 }
 
 // Close implements C.ProxyAdapter
