@@ -20,6 +20,7 @@ func TestAntiLagHistoryIsolation(t *testing.T) {
 	m := labMeta(netip.MustParseAddrPort("192.0.2.9:1000"))
 	m.Process = "game"
 	m.DstIPASN = "64500"
+	m.DestinationRegion, m.GeoSource = "eu-central-1", "aws"
 	h.event(m, "B", antiDial, nil, 0)
 	require.Zero(t, h.evaluate(m, "B").tier, "opening a UDP socket is not a reply")
 	h.event(m, "B", antiReply, nil, 30*time.Millisecond)

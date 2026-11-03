@@ -24,6 +24,17 @@ type ASNReader struct {
 	*maxminddb.Reader
 }
 
+func NewIPReader(reader *maxminddb.Reader) IPReader {
+	r := IPReader{Reader: reader}
+	switch reader.Metadata.DatabaseType {
+	case "sing-geoip":
+		r.databaseType = typeSing
+	case "Meta-geoip0":
+		r.databaseType = typeMetaV0
+	}
+	return r
+}
+
 type GeoLite2 struct {
 	AutonomousSystemNumber       uint32 `maxminddb:"autonomous_system_number"`
 	AutonomousSystemOrganization string `maxminddb:"autonomous_system_organization"`

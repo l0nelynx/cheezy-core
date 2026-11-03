@@ -102,8 +102,9 @@ confirmed regional winner as the cost floor until a challenger qualifies.
 Real first-response times blend into that prior with weight n/(n+4).
 Effective sample count decays with a 12-hour half-life and is capped at
 16 for weighting. Older cache entries seed one observation. Exact endpoints
-receive full weight, service/prefix evidence 45%, service/ASN evidence
-20%. The highest-confidence source wins. Each recent consecutive failure
+receive full weight, service/prefix evidence 45%, service/region evidence
+15%, and service/ASN within that region 20%. The highest-confidence source wins.
+Legacy exact endpoint records remain usable. Each recent consecutive failure
 also adds a fading penalty (40 cost units per failure up to three, five-minute
 half-life). History separates TCP and UDP, address family, group and
 profile. Route history is capped at 4096 entries with seven-day expiry.
@@ -148,6 +149,35 @@ actual match continuity must be measured in the game.
 
 ## Passive quality measurements
 
+The group classifies each destination locally. A bundled IPv4/IPv6 snapshot
+of [AWS ranges](https://ip-ranges.amazonaws.com/ip-ranges.json) supplies the
+most specific region or network border group. Global accelerators and
+ambiguous entries are marked `global`. Other public IPs use the country
+from the profile's optional country MMDB. Without a match the region is
+`unknown`. Neither global nor unknown destinations share service/ASN history.
+Known regions also isolate prefix history. For a new address, one quarter
+of the observed service/region stall penalty can contribute until exact
+stall evidence arrives. It appears separately under `regionalStallCost`.
+
+The group periodically refreshes the public AWS feed in the background and
+caches successful updates in bbolt. Exit-country probes use the existing
+Smart trace services through individual candidates. A fresh country match
+gives a candidate with no route history a two-unit cold-start credit.
+Missing country data is neutral. A trace reflects the exit to the trace
+service and may differ from the exit for another target.
+
+The authorized controller exposes `GET /group/{name}/decisions` in reverse
+chronological order. A profile/group retains the most recent 256 UDP path
+decisions and checkpoints them on the history flush and on shutdown.
+`destinationRegion`, `geoSource` and each candidate's optional
+`exitCountry` describe the geography at decision time. Candidate features
+and costs are captured before dialing or applying a trial/manual override.
+Outcomes on the selected path include first response, active seconds, stall
+count, excess seconds and confirmed failure. Zero active seconds means
+there was insufficient measured exchange. An active record recovered on
+restart is marked interrupted. These observations can be exported for
+offline training; this version uses the deterministic ranking above.
+
 Both signals contribute to the cost for new connections and reserve selection.
 They work without a configured reflector and do not trigger live failover.
 
@@ -174,6 +204,49 @@ They work without a configured reflector and do not trigger live failover.
   sent packets carry zero cost, and the weight reaches full strength at 32.
   Closing the connection removes the sample. Reconnecting starts a new
   generation. Sampling reads local counters without sending probes.
+
+## Offline LightGBM and shadow predictions
+
+The existing decision endpoint can already feed the collector. On the machine
+running the controller, set `MIHOMO_SECRET` in the environment and run:
+
+```powershell
+python hack/antilag-lightgbm.py collect ./samples --group AntiLag --process Darktide.exe --watch
+```
+
+This polls loopback every 30 seconds and saves completed decisions locally.
+Leave the collector running during play to archive new records before the
+256-decision ring rotates. Without `--watch` it exports one snapshot.
+Use one directory per profile and group. Overlapping exports are deduplicated.
+
+Install the Python training dependencies in a virtual environment
+(`python -m pip install lightgbm numpy`, verified with LightGBM 4.7).
+Train from a directory of snapshots or a list of JSON files:
+
+```powershell
+python hack/antilag-lightgbm.py train ./samples --process Darktide.exe --output ./darktide-stalls.json
+```
+
+The target is excess stall seconds per active minute on the selected UDP
+path. Only completed observations with at least 20 active seconds contribute.
+Weights reflect active time, capped at 300 seconds per observation. The
+latest 20% of bindings form a chronological holdout. Training excludes paths
+whose outcomes were still pending when validation began. The first version
+requires at least 100 distinct eligible bindings, 80 in training, varying
+training labels and multiple observed exits in one known training region.
+These are collection gates. The printed errors compare prediction MAE on
+observed outcomes to a constant baseline. Route improvement still requires
+comparisons across exits. Early failures without 20 active seconds are
+outside this model's target.
+
+Place the resulting bundle in the core's profile directory and set
+`shadow-model: darktide-stalls.json` on the AntiLag group. Reload the
+profile. Group details expose `shadowStatus` (`disabled`, `unavailable` or
+`ready`), the file fingerprint and applicable process. Bindings and
+decision records expose `shadowWinner` and per-candidate
+`predictedStallSecondsPerActiveMinute` when predictions are available.
+The journal freezes predictions at selection time. Model scores have no
+effect on proxy choice, reserve preparation or failover.
 
 ## Reproduce
 

@@ -146,21 +146,26 @@ func (f *antiFlow) flushStalls(p *antiPath, force bool) {
 		return
 	}
 	f.socket.group.history.addStalls(f.meta, p.name, p.stalls.pending, p.stalls.event)
+	f.socket.group.history.journal.stalls(p, p.stalls.pending)
 	p.stalls.pending = stallDelta{}
 }
 func (h *antiHistory) addStalls(m *C.Metadata, node string, d stallDelta, now time.Time) {
-	key := antiKeys(m, node)[0]
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	r := h.records[key]
-	if r.Stalls == nil {
-		r.Stalls = &stallHistory{}
+	for i, key := range antiKeys(m, node) {
+		if i != 0 && i != 2 {
+			continue
+		} // exact endpoint and service in this region
+		r := h.records[key]
+		if r.Stalls == nil {
+			r.Stalls = &stallHistory{}
+		}
+		r.Stalls.add(d, now)
+		if now.After(r.Seen) {
+			r.Seen = now
+		}
+		h.records[key] = r
 	}
-	r.Stalls.add(d, now)
-	if now.After(r.Seen) {
-		r.Seen = now
-	}
-	h.records[key] = r
 	h.trim()
 	h.dirty = true
 }

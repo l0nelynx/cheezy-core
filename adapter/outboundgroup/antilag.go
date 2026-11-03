@@ -17,13 +17,16 @@ import (
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/mmdb"
 	"github.com/metacubex/mihomo/component/profile/cachefile"
+	"github.com/metacubex/mihomo/component/smart"
 	C "github.com/metacubex/mihomo/constant"
 	P "github.com/metacubex/mihomo/constant/provider"
+	"github.com/metacubex/mihomo/log"
 	"github.com/oschwald/maxminddb-golang"
 )
 
 type AntiLagOption struct {
-	Targets []AntiLagTarget `group:"probe-targets,omitempty"`
+	ShadowModel string          `group:"shadow-model,omitempty"`
+	Targets     []AntiLagTarget `group:"probe-targets,omitempty"`
 }
 type AntiLagTarget struct {
 	Address  string         `group:"address"`
@@ -33,20 +36,25 @@ type AntiLagTarget struct {
 }
 type AntiLag struct {
 	*GroupBase
-	url          string
-	disableUDP   bool
-	targets      []AntiLagTarget
-	ctx          context.Context
-	cancel       context.CancelFunc
-	mu           sync.Mutex
-	flows        map[string]*antiFlow
-	parents      map[*antiSocket]bool
-	history      *antiHistory
-	asn          *maxminddb.Reader
-	measurements map[netip.AddrPort]*antiRegion
-	once         sync.Once
-	workers      sync.WaitGroup
-	regionalBusy bool
+	shadow               *antiShadowModel
+	shadowStatus         string
+	countryPath, asnPath string
+	url                  string
+	disableUDP           bool
+	targets              []AntiLagTarget
+	ctx                  context.Context
+	cancel               context.CancelFunc
+	mu                   sync.Mutex
+	flows                map[string]*antiFlow
+	parents              map[*antiSocket]bool
+	history              *antiHistory
+	asn                  *maxminddb.Reader
+	country              mmdb.IPReader
+	exits                *smart.ExitWatcher
+	measurements         map[netip.AddrPort]*antiRegion
+	once                 sync.Once
+	workers              sync.WaitGroup
+	regionalBusy         bool
 }
 
 func NewAntiLag(o GroupCommonOption, opt AntiLagOption, empty C.Proxy, providers []P.ProxyProvider) (*AntiLag, error) {
@@ -84,25 +92,25 @@ func NewAntiLag(o GroupCommonOption, opt AntiLagOption, empty C.Proxy, providers
 		flows: make(map[string]*antiFlow), measurements: make(map[netip.AddrPort]*antiRegion),
 	}
 	g.history = newAntiHistory(cachefile.Cache().DB, C.Path.Config(), o.Name)
+	g.shadowStatus = "disabled"
+	if opt.ShadowModel != "" {
+		model, err := loadAntiShadow(opt.ShadowModel)
+		if err != nil {
+			g.shadowStatus = "unavailable"
+			log.Warnln("[AntiLag] %s: shadow model unavailable: %v", o.Name, err)
+		} else {
+			g.shadow = model
+			g.shadowStatus = "ready"
+		}
+	}
+	loadBundledAWS()
+	g.exits = smart.NewExitWatcher(smart.ExitWatcherOptions{Name: o.Name})
+	g.countryPath, g.asnPath = C.Path.MMDB(), C.Path.ASN()
+	g.loadLocalGeo()
 	g.loadRegions()
 	return g, nil
 }
 
-// ASN enrichment is optional. Missing local data must not initiate a download
-// or prevent the group from choosing an exit.
-func (g *AntiLag) enrichASN(m *C.Metadata) {
-	if m.DstIPASN != "" || !m.DstIP.IsValid() {
-		return
-	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.asn != nil {
-		asn, _ := (mmdb.ASNReader{Reader: g.asn}).LookupASN(m.DstIP.AsSlice())
-		if asn != "0" {
-			m.DstIPASN = asn
-		}
-	}
-}
 func (g *AntiLag) start() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -110,8 +118,24 @@ func (g *AntiLag) start() {
 		return
 	}
 	g.once.Do(func() {
-		if path := C.Path.ASN(); path != "" {
-			g.asn, _ = maxminddb.Open(path)
+		// Config parsing may precede the previous group's final checkpoint.
+		g.history.journal.once.Do(g.history.loadJournal)
+		if g.exits != nil {
+			g.workers.Add(1)
+			go func() {
+				defer g.workers.Done()
+				timer := time.NewTicker(time.Hour)
+				defer timer.Stop()
+				for {
+					refreshAWS(g.ctx, g.history.db)
+					select {
+					case <-g.ctx.Done():
+						return
+					case <-timer.C:
+						g.loadLocalGeo()
+					}
+				}
+			}()
 		}
 		g.workers.Add(1)
 		go func() { defer g.workers.Done(); g.monitor() }()
@@ -146,7 +170,12 @@ func (g *AntiLag) MarshalJSON() ([]byte, error) {
 	for _, p := range g.Proxies() {
 		names = append(names, p.Name())
 	}
-	return json.Marshal(map[string]any{"type": g.Type().String(), "all": names, "now": g.Now(), "hidden": g.Hidden(), "icon": g.Icon(), "testUrl": g.url})
+	info := map[string]any{"type": g.Type().String(), "all": names, "now": g.Now(), "hidden": g.Hidden(), "icon": g.Icon(), "testUrl": g.url, "shadowStatus": g.shadowStatus}
+	if g.shadow != nil {
+		info["shadowModelId"] = g.shadow.id
+		info["shadowProcess"] = g.shadow.process
+	}
+	return json.Marshal(info)
 }
 func (g *AntiLag) target(ip netip.Addr) netip.AddrPort {
 	best := -2
@@ -162,6 +191,10 @@ func (g *AntiLag) target(ip netip.Addr) netip.AddrPort {
 }
 
 type antiCandidate struct {
+	regionStallCost                                             float64
+	prior                                                       float64
+	exitCountry                                                 string
+	geoCredit                                                   float64
 	stalls                                                      *antiStallEvidence
 	outer                                                       *C.OuterQUICQuality
 	score, confidence, failurePenalty, cadenceWeight, cadenceMS float64
@@ -202,11 +235,23 @@ func (g *AntiLag) candidates(m *C.Metadata, touch bool) []antiCandidate {
 		}
 		c := g.history.evaluate(m, p.Name())
 		c.proxy = p
+		if g.exits != nil {
+			info := g.exits.Info(p.Name())
+			if time.Since(time.Unix(info.Updated, 0)) < 6*time.Hour {
+				c.exitCountry = countryCode(info.Region)
+			}
+			if touch && m.DstIP.IsGlobalUnicast() && !m.DstIP.IsPrivate() {
+				g.probeExit(p)
+			}
+		}
 		if reporter, ok := p.Adapter().(C.OuterQUICReporter); ok {
 			c.outer = reporter.OuterQUIC()
 		}
 		c.delay = p.LastDelayForTestUrl(g.url)
 		c.regional = m.NetWork == C.UDP && regional == p.Name()
+		if c.exitCountry != "" && c.exitCountry == m.DestinationCountry && c.tier == 0 && len(grades) == 0 && !c.failed && c.failurePenalty == 0 {
+			c.geoCredit = 2
+		}
 		if c.regional && c.tier == 0 {
 			c.reason = "regional-probe"
 		}
@@ -246,7 +291,8 @@ func rankAntiCandidates(list []antiCandidate, grades map[string]probeGrade, lead
 				c.reason = "regional-probe"
 			}
 		}
-		c.score = (1-c.confidence)*prior + c.confidence*c.penalty + c.failurePenalty
+		c.prior = prior
+		c.score = (1-c.confidence)*prior + c.confidence*c.penalty + c.failurePenalty + c.regionStallCost - c.geoCredit
 		if c.stalls != nil {
 			c.score += c.stalls.Penalty
 		}
@@ -316,7 +362,7 @@ func (g *AntiLag) DialContext(ctx context.Context, m *C.Metadata) (C.Conn, error
 	}
 	var last error
 	m = m.Clone()
-	g.enrichASN(m)
+	g.enrichGeo(m)
 	options := g.candidates(m, true)
 	exploreAntiCandidate(options)
 	for _, c := range options {
@@ -408,10 +454,6 @@ func (g *AntiLag) Failover(ctx context.Context, id, name string) error {
 func (g *AntiLag) Close() error {
 	g.mu.Lock()
 	g.cancel()
-	if g.asn != nil {
-		g.asn.Close()
-		g.asn = nil
-	}
 	var parents []*antiSocket
 	for s := range g.parents {
 		parents = append(parents, s)

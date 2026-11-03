@@ -225,6 +225,20 @@ func (g *AntiLag) monitor() {
 			flows = append(flows, f)
 		}
 		g.mu.Unlock()
+		if g.exits != nil && tick%5 == 0 {
+			for _, f := range flows {
+				if ip := f.dest.Addr(); ip.IsGlobalUnicast() && !ip.IsPrivate() {
+					nodes := g.Proxies()
+					if len(nodes) > 0 {
+						p := nodes[(tick/5)%len(nodes)]
+						if p.SupportUDP() && p.AliveForTestUrl(g.url) {
+							g.probeExit(p)
+						}
+					}
+					break
+				}
+			}
+		}
 		pairs := map[probePair][]*antiFlow{}
 		for _, f := range flows {
 			f.mu.Lock()

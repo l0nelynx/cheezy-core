@@ -21,6 +21,7 @@ import (
 )
 
 type antiPath struct {
+	decision *antiDecision
 	C.PacketConn
 	name        string
 	member      C.Proxy
@@ -140,36 +141,54 @@ type antiFlow struct {
 	switchTime                      time.Duration
 }
 type antiBindingInfo struct {
-	Candidates  []antiCandidateInfo     `json:"candidates"`
-	History     *antiHistoryEvidence    `json:"history,omitempty"`
-	ID          string                  `json:"id"`
-	Destination string                  `json:"destination"`
-	Source      string                  `json:"source,omitempty"`
-	Process     string                  `json:"process,omitempty"`
-	Active      string                  `json:"active"`
-	Reserve     string                  `json:"reserve"`
-	Selection   string                  `json:"selection"`
-	Reason      string                  `json:"reason"`
-	Changed     time.Time               `json:"changedAt"`
-	PrepareMS   float64                 `json:"prepareMs"`
-	SwitchMS    float64                 `json:"switchMs"`
-	DetectMS    float64                 `json:"detectMs"`
-	GapMS       *float64                `json:"receiveGapMs"`
-	Control     string                  `json:"control,omitempty"`
-	Evidence    map[string]antiEvidence `json:"evidence,omitempty"`
+	ShadowWinner       string                  `json:"shadowWinner,omitempty"`
+	DestinationRegion  string                  `json:"destinationRegion"`
+	GeoSource          string                  `json:"geoSource"`
+	DestinationCountry string                  `json:"destinationCountry,omitempty"`
+	Candidates         []antiCandidateInfo     `json:"candidates"`
+	History            *antiHistoryEvidence    `json:"history,omitempty"`
+	ID                 string                  `json:"id"`
+	Destination        string                  `json:"destination"`
+	Source             string                  `json:"source,omitempty"`
+	Process            string                  `json:"process,omitempty"`
+	Active             string                  `json:"active"`
+	Reserve            string                  `json:"reserve"`
+	Selection          string                  `json:"selection"`
+	Reason             string                  `json:"reason"`
+	Changed            time.Time               `json:"changedAt"`
+	PrepareMS          float64                 `json:"prepareMs"`
+	SwitchMS           float64                 `json:"switchMs"`
+	DetectMS           float64                 `json:"detectMs"`
+	GapMS              *float64                `json:"receiveGapMs"`
+	Control            string                  `json:"control,omitempty"`
+	Evidence           map[string]antiEvidence `json:"evidence,omitempty"`
 }
 
 type antiCandidateInfo struct {
-	Stalls      *antiStallEvidence   `json:"stalls,omitempty"`
-	Outer       *C.OuterQUICQuality  `json:"outerQuic,omitempty"`
-	Node        string               `json:"node"`
-	Cost        float64              `json:"cost"`
-	Source      string               `json:"source"`
-	Cooldown    bool                 `json:"cooldown"`
-	Starts      uint64               `json:"starts"`
-	History     *antiHistoryEvidence `json:"history,omitempty"`
-	GapSpreadMS float64              `json:"gapSpreadMs"`
-	GapWeight   float64              `json:"gapWeight"`
+	PredictedStallSeconds *float64             `json:"predictedStallSecondsPerActiveMinute,omitempty"`
+	Prior                 float64              `json:"priorCost"`
+	RegionalStallCost     float64              `json:"regionalStallCost"`
+	ExitCountry           string               `json:"exitCountry,omitempty"`
+	GeoCredit             float64              `json:"geoCredit"`
+	HealthDelay           uint16               `json:"healthDelayMs"`
+	FailurePenalty        float64              `json:"failurePenalty"`
+	Stalls                *antiStallEvidence   `json:"stalls,omitempty"`
+	Outer                 *C.OuterQUICQuality  `json:"outerQuic,omitempty"`
+	Node                  string               `json:"node"`
+	Cost                  float64              `json:"cost"`
+	Source                string               `json:"source"`
+	Cooldown              bool                 `json:"cooldown"`
+	Starts                uint64               `json:"starts"`
+	History               *antiHistoryEvidence `json:"history,omitempty"`
+	GapSpreadMS           float64              `json:"gapSpreadMs"`
+	GapWeight             float64              `json:"gapWeight"`
+}
+
+func candidateInfo(c antiCandidate) antiCandidateInfo {
+	return antiCandidateInfo{Node: c.proxy.Name(), Cost: c.score, Source: c.reason, Cooldown: c.failed, Starts: c.starts,
+		History: c.historyEvidence, GapSpreadMS: c.cadenceMS, GapWeight: c.cadenceWeight,
+		Stalls: c.stalls, Outer: c.outer, ExitCountry: c.exitCountry, GeoCredit: c.geoCredit, HealthDelay: c.delay, FailurePenalty: c.failurePenalty,
+		Prior: c.prior, RegionalStallCost: c.regionStallCost}
 }
 
 func (f *antiFlow) info() antiBindingInfo {
@@ -177,6 +196,7 @@ func (f *antiFlow) info() antiBindingInfo {
 	v := antiBindingInfo{ID: f.id, Destination: f.dest.String(), Selection: f.selection, Reason: f.reason, Changed: f.changed, PrepareMS: float64(f.prepare) / 1e6, DetectMS: float64(f.detect) / 1e6}
 	v.SwitchMS = float64(f.switchTime) / 1e6
 	v.Process = f.meta.Process
+	v.DestinationRegion, v.GeoSource, v.DestinationCountry = f.meta.DestinationRegion, f.meta.GeoSource, f.meta.DestinationCountry
 	if f.meta.SrcIP.IsValid() {
 		v.Source = f.meta.SourceAddrPort().String()
 	}
@@ -192,13 +212,7 @@ func (f *antiFlow) info() antiBindingInfo {
 	}
 	f.mu.Unlock()
 	g := f.socket.group
-	for _, c := range g.candidates(f.meta, false) {
-		v.Candidates = append(v.Candidates, antiCandidateInfo{
-			Node: c.proxy.Name(), Cost: c.score, Source: c.reason, Cooldown: c.failed, Starts: c.starts,
-			History: c.historyEvidence, GapSpreadMS: c.cadenceMS, GapWeight: c.cadenceWeight,
-			Stalls: c.stalls, Outer: c.outer,
-		})
-	}
+	v.Candidates, v.ShadowWinner = g.describeCandidates(f.meta, g.candidates(f.meta, false))
 	if v.Active != "" {
 		v.History = g.history.evaluate(f.meta, v.Active).historyEvidence
 	}
@@ -261,7 +275,7 @@ func (s *antiSocket) binding(ctx context.Context, dest netip.AddrPort) (*antiFlo
 	m.DstIP = dest.Addr()
 	m.DstPort = dest.Port()
 	m.NetWork = C.UDP
-	s.group.enrichASN(m)
+	s.group.enrichGeo(m)
 	f := &antiFlow{socket: s, id: utils.NewUUIDV4().String(), dest: dest, meta: m, ready: make(chan struct{}), switchGate: make(chan struct{}, 1), lastUse: time.Now()}
 	s.flows[dest] = f
 	s.mu.Unlock()
@@ -329,6 +343,13 @@ func (f *antiFlow) change(ctx context.Context, name string, expected *antiPath, 
 		expected.failureOnce.Do(func() { f.socket.group.history.event(f.meta, expected.name, antiFailure, nil, 0) })
 	}
 	options := f.socket.group.candidates(f.meta, true)
+	journal := &f.socket.group.history.journal
+	row := &antiDecision{Binding: f.id, Started: start, Destination: f.dest.String(), DestinationRegion: f.meta.DestinationRegion,
+		DestinationCountry: f.meta.DestinationCountry, GeoSource: f.meta.GeoSource, ASN: f.meta.DstIPASN, Process: f.meta.Process, Trigger: reason}
+	row.Candidates, row.ShadowWinner = f.socket.group.describeCandidates(f.meta, options)
+	if row.ShadowWinner != "" {
+		row.ShadowModelID = f.socket.group.shadow.id
+	}
 	if reason == "initial" {
 		exploreAntiCandidate(options)
 	}
@@ -365,8 +386,13 @@ func (f *antiFlow) change(ctx context.Context, name string, expected *antiPath, 
 			selection = c.reason
 			break
 		}
+		row.DialFailures = append(row.DialFailures, c.proxy.Name())
 	}
 	if next == nil {
+		now := time.Now()
+		row.Ended = &now
+		row.Status = "unavailable"
+		journal.add(row)
 		if last == nil {
 			last = errors.New("antilag: no available replacement path")
 		}
@@ -387,6 +413,10 @@ func (f *antiFlow) change(ctx context.Context, name string, expected *antiPath, 
 	}
 	stale := f.reserve
 	f.flushStalls(old, true)
+	journal.end(old, reason, expected != nil)
+	row.Selected, row.Selection, row.Status = next.name, selection, "active"
+	journal.add(row)
+	next.decision = row
 	f.active = next
 	f.reserve = nil
 	f.changed = time.Now()
@@ -482,6 +512,7 @@ func (f *antiFlow) fail(path *antiPath, reason string, elapsed time.Duration) er
 		f.mu.Lock()
 		if f.active == path {
 			f.flushStalls(path, true)
+			f.socket.group.history.journal.end(path, reason, true)
 			f.active = nil
 		}
 		f.mu.Unlock()
@@ -565,6 +596,7 @@ func (s *antiSocket) WaitReadFrom() ([]byte, func(), net.Addr, error) {
 			start := p.firstWrite
 			if first {
 				p.observed = true
+				s.group.history.journal.reply(p, now.Sub(start))
 			}
 			f.mu.Unlock()
 			if completed {
@@ -687,6 +719,7 @@ func (f *antiFlow) close() {
 	f.closed = true
 	a, b := f.active, f.reserve
 	f.flushStalls(a, true)
+	f.socket.group.history.journal.end(a, "closed", false)
 	f.active = nil
 	f.reserve = nil
 	f.mu.Unlock()

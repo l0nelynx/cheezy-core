@@ -36,6 +36,7 @@ type antiRecord struct {
 	LastCadence              time.Time
 }
 type antiHistory struct {
+	journal antiJournal
 	mu      sync.Mutex
 	db      *bbolt.DB
 	key     []byte
@@ -91,6 +92,7 @@ func newAntiHistory(db *bbolt.DB, profile, name string) *antiHistory {
 	return h
 }
 func (h *antiHistory) flush() {
+	defer h.saveJournal()
 	h.mu.Lock()
 	if !h.dirty || h.db == nil {
 		h.mu.Unlock()
@@ -140,9 +142,16 @@ func antiKeys(m *C.Metadata, node string) []string {
 	}
 	if ip.IsValid() && service != "" {
 		p := netip.PrefixFrom(ip, bits).Masked()
+		scope := m.DestinationRegion
+		if scope != "" && scope != "unknown" {
+			prefix += m.GeoSource + "|" + scope + "|"
+		}
 		keys = append(keys, prefix+"net:"+service+"|"+p.String())
-		if fields := strings.Fields(m.DstIPASN); len(fields) > 0 && fields[0] != "unknown" {
-			keys = append(keys, prefix+"asn:"+service+"|"+strings.TrimPrefix(fields[0], "AS"))
+		if scope != "" && scope != "global" && scope != "unknown" {
+			keys = append(keys, prefix+"region:"+service)
+			if fields := strings.Fields(m.DstIPASN); len(fields) > 0 && fields[0] != "unknown" {
+				keys = append(keys, prefix+"asn:"+service+"|"+strings.TrimPrefix(fields[0], "AS"))
+			}
 		}
 	}
 	return keys
@@ -201,6 +210,11 @@ func (h *antiHistory) evaluate(m *C.Metadata, node string) antiCandidate {
 		if !ok || time.Since(r.Seen) > antiTTL {
 			continue
 		}
+		if i == 2 && c.stalls == nil {
+			if regional := r.Stalls.evidence(now); regional != nil {
+				c.regionStallCost = regional.Penalty * 0.25
+			}
+		}
 		if i == 0 {
 			c.stalls = r.Stalls.evidence(now)
 			c.starts = r.Starts
@@ -217,14 +231,14 @@ func (h *antiHistory) evaluate(m *C.Metadata, node string) antiCandidate {
 		}
 		if r.Replies > 0 && time.Since(r.LastReply) <= antiTTL {
 			mass := agedMass(r.ReplyMass, r.LastReply, now)
-			weight := mass / (mass + 4) * [...]float64{1, 0.45, 0.2}[i]
+			weight := mass / (mass + 4) * [...]float64{1, 0.45, 0.15, 0.2}[i]
 			if weight <= c.confidence {
 				continue
 			}
 			c.confidence = weight
-			c.tier = 3 - i
+			c.tier = [...]int{3, 2, 1, 1}[i]
 			c.penalty = r.FirstResponseMS
-			c.reason = []string{"destination-history", "prefix-history", "asn-history"}[i]
+			c.reason = []string{"destination-history", "prefix-history", "region-history", "regional-asn-history"}[i]
 			c.historyEvidence = &antiHistoryEvidence{c.reason, r.Opens, r.Replies, r.LastReply, r.FirstResponseMS, weight}
 		}
 	}

@@ -19,7 +19,7 @@ def port(kind):
         return sock.getsockname()[1]
 
 
-def main(binary):
+def main(binary, model=None):
     token = secrets.token_hex(16)
     controller = port(socket.SOCK_STREAM)
     inbound = port(socket.SOCK_DGRAM)
@@ -47,6 +47,9 @@ def main(binary):
             "rules": ["MATCH,game"],
         }
         config = Path(directory, "config.yaml")
+        if model:
+            Path(directory, "shadow.json").write_bytes(Path(model).read_bytes())
+            conf["proxy-groups"][0]["shadow-model"] = "shadow.json"
         config.write_text(json.dumps(conf), encoding="utf-8")
         def serve():
             while True:
@@ -77,6 +80,10 @@ def main(binary):
                         time.sleep(.1)
                 else:
                     raise RuntimeError("controller did not start")
+                group = api("/group/game")
+                assert group["shadowStatus"] == ("ready" if model else "disabled")
+                if model:
+                    assert group["shadowModelId"]
                 try:
                     api("/group/game/bindings", secret="wrong")
                 except urllib.error.HTTPError as exc:
@@ -116,6 +123,12 @@ def main(binary):
                     old = next(c for c in final["candidates"] if c["node"] == binding["active"])
                     assert old["stalls"]["events"] == 1 and old["stalls"]["excessSeconds"] > 0
                     assert old["stalls"]["perActiveMinute"] > 0
+                    decisions = api("/group/game/decisions")
+                    current, previous = [d for d in decisions if d["binding"] == binding["id"]]
+                    assert previous["status"] == "manual" and previous["events"] == 1
+                    assert previous["destinationRegion"] == "unknown" and previous["geoSource"] == "unknown"
+                    assert previous["firstResponseMs"] is not None and previous["activeSeconds"] > 0
+                    assert current["selected"] == candidate and current["status"] == "active"
                     updated = displayed()
                     assert updated["id"] == initial["id"]
                     assert updated["chains"] == [candidate, "game"]
@@ -126,4 +139,4 @@ def main(binary):
 
 
 if __name__ == "__main__":
-    main(str(Path(sys.argv[1]).resolve()))
+    main(str(Path(sys.argv[1]).resolve()), *sys.argv[2:])
