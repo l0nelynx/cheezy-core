@@ -24,6 +24,17 @@ type ASNReader struct {
 	*maxminddb.Reader
 }
 
+func NewIPReader(reader *maxminddb.Reader) IPReader {
+	r := IPReader{Reader: reader}
+	switch reader.Metadata.DatabaseType {
+	case "sing-geoip":
+		r.databaseType = typeSing
+	case "Meta-geoip0":
+		r.databaseType = typeMetaV0
+	}
+	return r
+}
+
 type GeoLite2 struct {
 	AutonomousSystemNumber       uint32 `maxminddb:"autonomous_system_number"`
 	AutonomousSystemOrganization string `maxminddb:"autonomous_system_organization"`
@@ -81,7 +92,7 @@ func (r ASNReader) LookupASN(ip net.IP) (string, string) {
 	case "ipinfo generic_asn_free.mmdb":
 		var result IPInfo
 		_ = r.Lookup(ip, &result)
-		return result.ASN[2:], result.Name
+		return strings.TrimPrefix(result.ASN, "AS"), result.Name
 	default:
 		log.Warnln("Unsupported ASN type: %s", r.Metadata.DatabaseType)
 	}

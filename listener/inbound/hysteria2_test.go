@@ -1,10 +1,14 @@
 package inbound_test
 
 import (
+	"encoding/json"
 	"net/netip"
 	"testing"
+	"time"
 
+	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/adapter/outbound"
+	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/listener/inbound"
 
 	"github.com/stretchr/testify/assert"
@@ -48,9 +52,28 @@ func testInboundHysteria2(t *testing.T, inboundOptions inbound.Hysteria2Option, 
 	if !assert.NoError(t, err) {
 		return
 	}
-	defer out.Close()
+	wrapped := outbound.NewAutoCloseProxyAdapter(out)
+	defer wrapped.Close()
 
-	tunnel.DoTest(t, out)
+	proxy := adapter.NewProxy(wrapped)
+	assert.Nil(t, out.OuterQUIC())
+	tunnel.DoTest(t, proxy)
+	if t.Name() == "TestInboundHysteria2_TLS" {
+		assert.Eventually(t, func() bool {
+			q := out.OuterQUIC()
+			return q != nil && q.Generation > 0 && q.Sent >= 8 && q.Received > 0 && q.RTTUsed
+		}, 12*time.Second, 50*time.Millisecond)
+		payload, err := proxy.MarshalJSON()
+		if assert.NoError(t, err) {
+			var node struct {
+				Outer *C.OuterQUICQuality `json:"outerQuic"`
+			}
+			assert.NoError(t, json.Unmarshal(payload, &node))
+			assert.NotNil(t, node.Outer)
+		}
+		assert.NoError(t, wrapped.Close())
+		assert.Eventually(t, func() bool { return out.OuterQUIC() == nil }, time.Second, 10*time.Millisecond)
+	}
 }
 
 func testInboundHysteria2TLS(t *testing.T, inboundOptions inbound.Hysteria2Option, outboundOptions outbound.Hysteria2Option) {

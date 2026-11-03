@@ -32,6 +32,7 @@ const defaultHopInterval = 30
 
 type Hysteria2 struct {
 	*Base
+	quicMonitor hyQUICMonitor
 
 	option *Hysteria2Option
 	client *hysteria2.Client
@@ -273,7 +274,11 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
 			if err != nil {
 				return nil, nil, err
 			}
-			return common.DialQuic(ctx, addr, outbound.DialOptions(), dialer, tlsCfg, cfg, common.DialQuicOption{Early: early})
+			pc, conn, err := common.DialQuic(ctx, addr, outbound.DialOptions(), dialer, tlsCfg, cfg, common.DialQuicOption{Early: early})
+			if err == nil {
+				outbound.quicMonitor.attach(conn)
+			}
+			return pc, conn, err
 		}),
 		SetBBRCongestion: func(quicConn *quic.Conn) {
 			common.SetCongestionController(quicConn, "bbr", option.CWND, option.BBRProfile)

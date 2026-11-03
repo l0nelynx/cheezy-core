@@ -222,6 +222,12 @@ func ParseProxyGroup(config map[string]any, proxyMap map[string]C.Proxy, provide
 			return nil, err
 		}
 		return NewSmart(groupOption, opt, emptyFallback, providers)
+	case "antilag":
+		var opt AntiLagOption
+		if err := decoder.Decode(config, &opt); err != nil {
+			return nil, err
+		}
+		return NewAntiLag(groupOption, opt, emptyFallback, providers)
 	default:
 		return nil, fmt.Errorf("%w: %s", errType, groupOption.Type)
 	}

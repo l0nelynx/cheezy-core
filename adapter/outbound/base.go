@@ -427,6 +427,13 @@ func (p *autoCloseProxyAdapter) CloseIdle(idle time.Duration) {
 	}
 }
 
+func (p *autoCloseProxyAdapter) OuterQUIC() *C.OuterQUICQuality {
+	if reporter, ok := p.ProxyAdapter.(C.OuterQUICReporter); ok {
+		return reporter.OuterQUIC()
+	}
+	return nil
+}
+
 func NewAutoCloseProxyAdapter(adapter ProxyAdapter) ProxyAdapter {
 	proxy := &autoCloseProxyAdapter{
 		ProxyAdapter: adapter,

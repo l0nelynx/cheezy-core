@@ -57,6 +57,7 @@ const (
 	EasyTier
 	GostRelay
 	Freedom
+	AntiLag
 )
 
 const (
@@ -269,6 +270,8 @@ func (at AdapterType) String() string {
 		return "LoadBalance"
 	case Smart:
 		return "Smart"
+	case AntiLag:
+		return "AntiLag"
 	default:
 		return "Unknown"
 	}

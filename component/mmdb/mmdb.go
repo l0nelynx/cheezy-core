@@ -31,15 +31,7 @@ func LoadFromBytes(buffer []byte) {
 		if err != nil {
 			log.Fatalln("Can't load mmdb: %s", err.Error())
 		}
-		ipReader = IPReader{Reader: mmdb}
-		switch mmdb.Metadata.DatabaseType {
-		case "sing-geoip":
-			ipReader.databaseType = typeSing
-		case "Meta-geoip0":
-			ipReader.databaseType = typeMetaV0
-		default:
-			ipReader.databaseType = typeMaxmind
-		}
+		ipReader = NewIPReader(mmdb)
 	})
 }
 
@@ -59,15 +51,7 @@ func IPInstance() IPReader {
 		if err != nil {
 			log.Fatalln("Can't load MMDB: %s", err.Error())
 		}
-		ipReader = IPReader{Reader: mmdb}
-		switch mmdb.Metadata.DatabaseType {
-		case "sing-geoip":
-			ipReader.databaseType = typeSing
-		case "Meta-geoip0":
-			ipReader.databaseType = typeMetaV0
-		default:
-			ipReader.databaseType = typeMaxmind
-		}
+		ipReader = NewIPReader(mmdb)
 	})
 
 	return ipReader

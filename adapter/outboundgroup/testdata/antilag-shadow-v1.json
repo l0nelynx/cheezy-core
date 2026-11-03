@@ -1,0 +1,23 @@
+{
+  "format": "antilag-stall-seconds-per-active-minute-v1",
+  "process": "Darktide.exe",
+  "categories": [
+    {
+      "field": "destinationRegion",
+      "value": "eu-central-1"
+    },
+    {
+      "field": "exitCountry",
+      "value": "DE"
+    },
+    {
+      "field": "node",
+      "value": "A"
+    },
+    {
+      "field": "node",
+      "value": "B"
+    }
+  ],
+  "booster": "tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nlabel_index=0\nmax_feature_idx=22\nobjective=regression\nfeature_names=priorCost starts geoCredit failurePenalty regionalStallCost gapSpreadMs gapWeight history_meanFirstResponseMs history_replies history_weight stalls_activeSeconds stalls_perActiveMinute stalls_excessSeconds outerQuic_sent outerQuic_received outerQuic_rttUsed outerQuic_inflationMs outerQuic_netLossFraction outerQuic_penalty cat_0 cat_1 cat_2 cat_3\nfeature_infos=none none none none none none none none none none none none none none none none none none none none none [0:1] [0:1]\ntree_sizes=315\n\nTree=0\nnum_leaves=2\nnum_cat=0\nsplit_feature=21\nsplit_gain=14112\nthreshold=1.0000000180025095e-35\ndecision_type=2\nleft_child=-1\nright_child=-2\nleaf_value=1.5300000014901161 1.6700000014901162\nleaf_weight=3600 3600\nleaf_count=60 60\ninternal_value=1.6\ninternal_weight=7200\ninternal_count=120\nis_linear=0\nshrinkage=1\n\n\nend of trees\n"
+}
