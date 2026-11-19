@@ -2,6 +2,7 @@ package outboundgroup
 
 import (
 	"context"
+	"encoding/json"
 	"net/netip"
 	"path/filepath"
 	"testing"
@@ -138,4 +139,50 @@ func TestAntiLagJournalSnapshotsAndRestore(t *testing.T) {
 	}
 	require.Len(t, g.Decisions(), antiJournalLimit)
 	require.Empty(t, g.Decisions()[antiJournalLimit-1].Binding)
+}
+
+func TestAntiLagOutcomeRetention(t *testing.T) {
+	db, err := bbolt.Open(filepath.Join(t.TempDir(), "outcomes"), 0600, nil)
+	require.NoError(t, err)
+	defer db.Close()
+	h := newAntiHistory(db, "test", "routes")
+	now := time.Now()
+	legacy := &antiDecision{Binding: "legacy", Status: "closed", Ended: &now, ActiveSeconds: 20}
+	data, err := json.Marshal([]*antiDecision{legacy})
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bbolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists(journalBucket)
+		if err != nil {
+			return err
+		}
+		return b.Put(h.key, data)
+	}))
+	h.loadJournal()
+	j := &h.journal
+	short := &antiDecision{Status: "closed", Ended: &now, ActiveSeconds: 19.99}
+	path := &antiPath{decision: &antiDecision{Status: "active", Binding: "match"}}
+	j.add(path.decision)
+	for i := 0; i <= antiJournalLimit; i++ {
+		j.add(short)
+	}
+	j.stalls(path, stallDelta{Active: 20 * time.Second})
+	j.end(path, "closed", false)
+	j.end(path, "closed", false)
+	j.add(&antiDecision{Status: "unavailable", Ended: &now})
+	j.add(&antiDecision{Binding: "dial", Status: "unavailable", Ended: &now, DialFailures: []string{"A"}})
+	broken := &antiPath{decision: &antiDecision{Binding: "broken", Status: "active"}}
+	j.add(broken.decision)
+	j.end(broken, "transport", true)
+	h.saveJournal()
+	restored := newAntiHistory(db, "test", "routes")
+	g := &AntiLag{history: restored}
+	outcomes := g.Outcomes()
+	require.Len(t, outcomes, 4)
+	require.Equal(t, []string{"broken", "dial", "match", "legacy"}, []string{outcomes[0].Binding, outcomes[1].Binding, outcomes[2].Binding, outcomes[3].Binding})
+	require.Len(t, g.Decisions(), antiJournalLimit)
+	for i := 0; i < antiOutcomeLimit; i++ {
+		restored.journal.add(legacy)
+	}
+	require.Len(t, g.Outcomes(), antiOutcomeLimit)
+	require.Equal(t, "legacy", g.Outcomes()[antiOutcomeLimit-1].Binding)
 }

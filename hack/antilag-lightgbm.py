@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -22,13 +23,22 @@ def collect(args):
             return None
 
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-    url = f"http://127.0.0.1:{args.port}/group/{urllib.parse.quote(args.group, safe='')}/decisions"
+    url = f"http://127.0.0.1:{args.port}/group/{urllib.parse.quote(args.group, safe='')}/outcomes"
     headers = {"Authorization": "Bearer " + os.environ.get("MIHOMO_SECRET", "")}
     args.directory.mkdir(exist_ok=True, parents=True)
     seen = set()
     while True:
         try:
-            with opener.open(urllib.request.Request(url, headers=headers), timeout=8) as response:
+            try:
+                response = opener.open(urllib.request.Request(url, headers=headers), timeout=8)
+            except urllib.error.HTTPError as exc:
+                if exc.code != 404:
+                    raise
+                exc.close()
+                # Older cores expose only the recent decisions.
+                recent = url.rsplit("/", 1)[0] + "/decisions"
+                response = opener.open(urllib.request.Request(recent, headers=headers), timeout=8)
+            with response:
                 rows = json.load(response)
         except OSError as exc:
             if not args.watch:
@@ -47,14 +57,16 @@ def collect(args):
             with path.open("x", encoding="utf-8") as out:
                 json.dump(rows, out, ensure_ascii=False)
             print(f"Saved {len(rows)} decisions to {path}", flush=True)
+        if args.progress:
+            show_progress(args)
         if not args.watch:
             return
         time.sleep(30)
 
 
-def samples(args):
+def samples(snapshots, process):
     unique = {}
-    paths = [file for path in args.snapshots for file in
+    paths = [file for path in snapshots for file in
              (sorted(path.glob("antilag-*.json")) if path.is_dir() else [path])]
     for path in paths:
         with path.open(encoding="utf-8-sig") as src:
@@ -62,7 +74,7 @@ def samples(args):
         if not isinstance(rows, list):
             raise ValueError(f"{path} is not a decision snapshot")
         for r in rows:
-            if r.get("process", "").casefold() != args.process.casefold():
+            if r.get("process", "").casefold() != process.casefold():
                 continue
             if not r.get("endedAt") or not r.get("selected") or r["status"] in ("active", "interrupted"):
                 continue
@@ -81,31 +93,51 @@ def samples(args):
     return sorted(unique.values(), key=lambda s: s[2])
 
 
-def split(samples):
+def evaluate_split(samples):
     # Keep path generations of one binding together. The training outcome must
     # already have been observable when the first held-out binding was opened.
     starts = {}
     for r, _, start, *_ in samples:
         starts.setdefault(r["binding"], start)
     bindings = sorted(starts, key=starts.get)
+    blockers = []
     if len(bindings) < 100:
-        raise ValueError(f"Only {len(bindings)} eligible bindings; collect at least 100.")
+        blockers.append(f"Eligible bindings: {len(bindings)}/100.")
     holdout = set(bindings[int(0.8 * len(bindings)):])
-    cutoff = min(starts[k] for k in holdout)
+    cutoff = min((starts[k] for k in holdout), default=None)
     validation = [s for s in samples if s[0]["binding"] in holdout]
     train = [s for s in samples if s[0]["binding"] not in holdout and s[3] < cutoff]
-    if len({s[0]["binding"] for s in train}) < 80:
-        raise ValueError("Fewer than 80 training bindings end before the validation period.")
+    train_count = len({s[0]["binding"] for s in train})
+    if train_count < 80:
+        blockers.append(f"Training bindings ending before validation: {train_count}/80.")
     nodes = {}
     for r, c, *_ in train:
         region = r.get("destinationRegion")
         if region and region not in ("unknown", "global"):
             nodes.setdefault(region, set()).add(c["node"])
     if not any(len(v) >= 2 for v in nodes.values()):
-        raise ValueError("Need observations on multiple exits in at least one identified region.")
+        blockers.append("Need observations on multiple exits in at least one identified region.")
     if len({s[4] for s in train}) < 2:
-        raise ValueError("Training labels are constant.")
-    return train, validation
+        blockers.append("Need at least two distinct observed stall rates in training.")
+    return train, validation, blockers
+
+
+def show_progress(args):
+    observations = samples([args.directory], args.process)
+    train_rows, validation, blockers = evaluate_split(observations)
+    bindings = {s[0]["binding"] for s in observations}
+    train_bindings = {s[0]["binding"] for s in train_rows}
+    validation_bindings = {s[0]["binding"] for s in validation}
+    print(f"{datetime.now().astimezone():%Y-%m-%d %H:%M:%S %z} | {args.group} | {args.process}")
+    print(f"Eligible bindings: {len(bindings)}/100 | remaining: {max(0, 100-len(bindings))} | "
+          f"train: {len(train_bindings)}/80 | holdout: {len(validation_bindings)}")
+    pairs = {}
+    for row, candidate, *_ in observations:
+        key = row.get("destinationRegion") or "unknown", candidate["node"]
+        pairs.setdefault(key, set()).add(row["binding"])
+    for (region, node), ids in sorted(pairs.items()):
+        print(f"  {region:<16} {node.strip()}   {len(ids)}")
+    print("Training gates: " + (" ".join(blockers) if blockers else "ready"), flush=True)
 
 
 def category_values(row, candidate):
@@ -126,7 +158,9 @@ def vector(row, candidate, paths, categories):
 
 
 def train(args):
-    data, validation = split(samples(args))
+    data, validation, blockers = evaluate_split(samples(args.snapshots, args.process))
+    if blockers:
+        raise ValueError(" ".join(blockers))
     import lightgbm as lgb
     import numpy as np
 
@@ -179,6 +213,7 @@ def main():
     collector.add_argument("--port", type=int, default=9090)
     collector.add_argument("--group", default="AntiLag")
     collector.add_argument("--watch", action="store_true", help="save newly completed decisions every 30 seconds")
+    collector.add_argument("--progress", action="store_true", help="report cumulative training readiness from saved snapshots")
     trainer = sub.add_parser("train")
     trainer.add_argument("snapshots", type=Path, nargs="+")
     trainer.add_argument("--process", default="Darktide.exe")

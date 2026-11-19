@@ -123,6 +123,7 @@ def main(binary, model=None):
                     old = next(c for c in final["candidates"] if c["node"] == binding["active"])
                     assert old["stalls"]["events"] == 1 and old["stalls"]["excessSeconds"] > 0
                     assert old["stalls"]["perActiveMinute"] > 0
+                    assert api("/group/game/outcomes") == []  # short manual switch
                     decisions = api("/group/game/decisions")
                     current, previous = [d for d in decisions if d["binding"] == binding["id"]]
                     assert previous["status"] == "manual" and previous["events"] == 1
