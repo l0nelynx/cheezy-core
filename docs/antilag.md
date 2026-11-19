@@ -169,6 +169,14 @@ service and may differ from the exit for another target.
 The authorized controller exposes `GET /group/{name}/decisions` in reverse
 chronological order. A profile/group retains the most recent 256 UDP path
 decisions and checkpoints them on the history flush and on shutdown.
+`GET /group/{name}/outcomes` separately retains the last 512 completed UDP
+path outcomes per profile/group, newest completion first. A path qualifies
+with at least 20 seconds of measured active exchange, a confirmed path
+failure, or an unavailable route with a failed candidate dial. A path can
+qualify at completion even after its opening decision left the recent journal.
+On upgrade, qualifying completed decisions still in the old cache seed the
+archive. TCP dial results and first successful reads feed the separate TCP
+route history. Both controller lists contain UDP only.
 `destinationRegion`, `geoSource` and each candidate's optional
 `exitCountry` describe the geography at decision time. Candidate features
 and costs are captured before dialing or applying a trial/manual override.
@@ -211,12 +219,14 @@ The existing decision endpoint can already feed the collector. On the machine
 running the controller, set `MIHOMO_SECRET` in the environment and run:
 
 ```powershell
-python hack/antilag-lightgbm.py collect ./samples --group AntiLag --process Darktide.exe --watch
+python hack/antilag-lightgbm.py collect ./samples --group AntiLag --process Darktide.exe --watch --progress
 ```
 
-This polls loopback every 30 seconds and saves completed decisions locally.
+This polls the outcomes archive on loopback every 30 seconds and saves newly completed qualifying decisions locally. Older cores fall back to the recent journal.
 Leave the collector running during play to archive new records before the
-256-decision ring rotates. Without `--watch` it exports one snapshot.
+outcomes archive rotates. With `--progress` each successful poll reports eligible
+bindings across saved snapshots, coverage by region and exit, and any unmet
+training gates. Counts refer to distinct UDP bindings rather than matches. Without `--watch` it exports one snapshot.
 Use one directory per profile and group. Overlapping exports are deduplicated.
 
 Install the Python training dependencies in a virtual environment

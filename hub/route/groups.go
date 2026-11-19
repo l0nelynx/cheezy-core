@@ -30,20 +30,27 @@ func groupRouter() http.Handler {
 		r.Get("/delay", getGroupDelay)
 		r.Get("/weights", getGroupWeights)
 		r.Get("/bindings", getAntiLagBindings)
-		r.Get("/decisions", getAntiLagDecisions)
+		r.Get("/decisions", getAntiLagDecisions(false))
+		r.Get("/outcomes", getAntiLagDecisions(true))
 		r.Post("/failover", switchAntiLagBinding)
 	})
 	return r
 }
 
-func getAntiLagDecisions(w http.ResponseWriter, r *http.Request) {
-	g, ok := r.Context().Value(CtxKeyProxy).(C.Proxy).Adapter().(*outboundgroup.AntiLag)
-	if !ok {
-		render.Status(r, http.StatusBadRequest)
-		render.JSON(w, r, newError("group must be antilag"))
-		return
+func getAntiLagDecisions(outcomes bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		g, ok := r.Context().Value(CtxKeyProxy).(C.Proxy).Adapter().(*outboundgroup.AntiLag)
+		if !ok {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, newError("group must be antilag"))
+			return
+		}
+		if outcomes {
+			render.JSON(w, r, g.Outcomes())
+			return
+		}
+		render.JSON(w, r, g.Decisions())
 	}
-	render.JSON(w, r, g.Decisions())
 }
 
 func getAntiLagBindings(w http.ResponseWriter, r *http.Request) {
